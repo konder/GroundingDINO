@@ -358,7 +358,9 @@ def build_image_index(data_root: str) -> Dict[str, List[str]]:
                         readahead=False, map_size=1024**3 * 100)
         with env.begin() as txn:
             for key_raw, _ in txn.cursor():
-                index[key_raw.decode()].append(part_path)
+                k = key_raw.decode()
+                if not k.startswith("__"):
+                    index[k].append(part_path)
         env.close()
     return dict(index)
 
@@ -394,6 +396,9 @@ def extract_annotations_from_segmentation(
         with env.begin() as txn:
             for key_raw, val_raw in txn.cursor():
                 key_str = key_raw.decode()
+
+                if key_str.startswith("__"):
+                    continue
 
                 has_image = (
                     (img_keys_for_partition and key_str in img_keys_for_partition)
