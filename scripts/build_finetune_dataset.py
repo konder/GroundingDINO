@@ -444,8 +444,14 @@ def extract_annotations_from_segmentation(
     image_index: Dict[str, List[str]],
     mask_height: int = 360,
     mask_width: int = 640,
+    max_frames_per_chunk: int = 8,
 ) -> Tuple[List[DetectionAnnotation], Dict[str, set]]:
-    """Walk segmentation DB, extract annotations for frames that have matching images."""
+    """Walk segmentation DB, extract annotations for frames that have matching images.
+
+    Only uses the first max_frames_per_chunk frames from each chunk.
+    Earlier frames in an event chunk are more likely to show the target object
+    intact (before it is broken/consumed), producing higher-quality bounding boxes.
+    """
     annotations: List[DetectionAnnotation] = []
     category_set: Dict[str, set] = defaultdict(set)
     ann_id = 0
@@ -462,6 +468,7 @@ def extract_annotations_from_segmentation(
             with img_env.begin() as img_txn:
                 img_keys_for_partition = {
                     k.decode() for k, _ in img_txn.cursor()
+                    if not k.decode().startswith("__")
                 }
             img_env.close()
 
@@ -487,6 +494,8 @@ def extract_annotations_from_segmentation(
                 frames = pickle.loads(val_raw)
 
                 for fi, frame_dict in enumerate(frames):
+                    if fi >= max_frames_per_chunk:
+                        break
                     for event_key, event_val in frame_dict.items():
                         if not isinstance(event_key, tuple) or len(event_key) < 2:
                             continue
@@ -655,11 +664,14 @@ def build_dataset(
     mask_width: int = 640,
     max_visualize: int = 0,
     raw_video_dir: Optional[str] = None,
+    max_frames_per_chunk: int = 8,
 ) -> dict:
     """Main pipeline: build fine-tuning dataset from MineStudio LMDB.
 
     If raw_video_dir is provided, frames are extracted from original MP4 files
     at 640x360 resolution instead of from LMDB video/image chunks.
+    max_frames_per_chunk controls how many frames to take from each 32-frame
+    chunk (earlier frames have higher annotation quality).
     """
     source = detect_video_source(data_root)
     use_raw = raw_video_dir is not None
@@ -685,9 +697,10 @@ def build_dataset(
                       for name in m.values() if name in raw_video_index)
         print(f"  Episodes with raw video: {matched}/{total_eps}")
 
-    print(f"[2/5] Extracting annotations from segmentation ...")
+    print(f"[2/5] Extracting annotations from segmentation (first {max_frames_per_chunk} frames/chunk) ...")
     annotations, cat_stats = extract_annotations_from_segmentation(
-        data_root, image_index, mask_height, mask_width
+        data_root, image_index, mask_height, mask_width,
+        max_frames_per_chunk=max_frames_per_chunk,
     )
     print(f"  Extracted {len(annotations)} annotations")
     print(f"  Categories: {', '.join(f'{k}({len(v)})' for k, v in sorted(cat_stats.items()))}")
@@ -835,6 +848,8 @@ def main():
                         help="Number of samples to visualize (0 = none)")
     parser.add_argument("--raw-video-dir", default=None,
                         help="Path to raw VPT MP4 video files for 640x360 frame extraction")
+    parser.add_argument("--max-frames", type=int, default=8,
+                        help="Max frames per 32-frame chunk (earlier = higher quality, default: 8)")
 
     args = parser.parse_args()
 
@@ -845,6 +860,7 @@ def main():
         mask_width=args.mask_width,
         max_visualize=args.visualize,
         raw_video_dir=args.raw_video_dir,
+        max_frames_per_chunk=args.max_frames,
     )
 
     print("\n" + "=" * 60)
