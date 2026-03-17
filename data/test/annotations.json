@@ -1,0 +1,133 @@
+{
+  "total": 16,
+  "annotations": {
+    "hunt_cowonly": {
+      "task": "hunt_cowonly",
+      "image": "hunt_cowonly_frame0.png",
+      "prompt": "Point to the cow",
+      "interaction_type": "hunt",
+      "bbox": [0.000, 0.506, 0.183, 0.889],
+      "label": "cow"
+    },
+    "hunt_fence": {
+      "task": "hunt_fence",
+      "image": "hunt_fence_frame0.png",
+      "prompt": "Point to the sheep in the right fence",
+      "interaction_type": "hunt",
+      "bbox": [0.594, 0.528, 0.812, 0.639],
+      "label": "sheep"
+    },
+    "interact_chest": {
+      "task": "interact_chest",
+      "image": "interact_chest_frame0.png",
+      "prompt": "Point to the middle chest",
+      "interaction_type": "interact",
+      "bbox": [0.453, 0.594, 0.534, 0.750],
+      "label": "chest"
+    },
+    "mine_coal": {
+      "task": "mine_coal",
+      "image": "mine_coal_frame0.png",
+      "prompt": "Point to the coal ore",
+      "interaction_type": "mine",
+      "bbox": [0.436, 0.625, 0.561, 0.825],
+      "label": "coal_ore"
+    },
+    "mine_emerald": {
+      "task": "mine_emerald",
+      "image": "mine_emerald_frame0.png",
+      "prompt": "Point to the emerald ore",
+      "interaction_type": "mine",
+      "bbox": [0.281, 0.614, 0.444, 0.806],
+      "label": "emerald_ore"
+    },
+    "craft": {
+      "task": "craft",
+      "image": "craft_frame0.png",
+      "prompt": "Point to the crafting table",
+      "interaction_type": "craft",
+      "bbox": [0.648, 0.722, 0.998, 0.995],
+      "label": "crafting_table"
+    },
+    "interact_house": {
+      "task": "interact_house",
+      "image": "interact_house_frame0.png",
+      "prompt": "Point to the house",
+      "interaction_type": "interact",
+      "bbox": [0.000, 0.000, 0.909, 0.944],
+      "label": "house"
+    },
+    "interact_portal": {
+      "task": "interact_portal",
+      "image": "interact_portal_frame0.png",
+      "prompt": "Point to the obsidian portal frame",
+      "interaction_type": "interact",
+      "bbox": [0.258, 0.078, 0.523, 0.642],
+      "label": "portal_frame"
+    },
+    "navigate_ocean": {
+      "task": "navigate_ocean",
+      "image": "navigate_ocean_frame0.png",
+      "prompt": "Point to the ocean",
+      "interaction_type": "approach",
+      "bbox": [0.758, 0.722, 0.998, 0.847],
+      "label": "ocean"
+    },
+    "navigate_village": {
+      "task": "navigate_village",
+      "image": "navigate_village_frame0.png",
+      "prompt": "Point to the village building",
+      "interaction_type": "approach",
+      "bbox": [0.622, 0.517, 0.991, 0.625],
+      "label": "village_building"
+    },
+    "place_door": {
+      "task": "place_door",
+      "image": "place_door_frame0.png",
+      "prompt": "Point to the diamond block to place the door on",
+      "interaction_type": "use",
+      "bbox": [0.444, 0.594, 0.559, 0.783],
+      "label": "diamond_block"
+    },
+    "place_minecart": {
+      "task": "place_minecart",
+      "image": "place_minecart_frame0.png",
+      "prompt": "Point to the rail to place minecart on",
+      "interaction_type": "use",
+      "bbox": [0.512, 0.750, 0.678, 0.806],
+      "label": "rail"
+    },
+    "build_bridge": {
+      "task": "build_bridge",
+      "image": "build_bridge_frame0.png",
+      "prompt": "Point to the edge of the cliff to build a bridge",
+      "interaction_type": "use",
+      "bbox": [0.623, 0.514, 0.998, 0.631],
+      "label": "cliff_edge"
+    },
+    "collect_wood": {
+      "task": "collect_wood",
+      "image": "collect_wood_frame0.png",
+      "prompt": "Point to the tree trunk",
+      "interaction_type": "mine",
+      "bbox": [0.078, 0.347, 0.277, 0.675],
+      "label": "tree_trunk"
+    },
+    "tool_fire": {
+      "task": "tool_fire",
+      "image": "tool_fire_frame0.png",
+      "prompt": "Point to the ground to start fire",
+      "interaction_type": "use",
+      "bbox": [0.406, 0.444, 0.594, 0.778],
+      "label": "ground"
+    },
+    "tool_lava": {
+      "task": "tool_lava",
+      "image": "tool_lava_frame0.png",
+      "prompt": "Point to the lava to scoop with bucket",
+      "interaction_type": "use",
+      "bbox": [0.156, 0.764, 0.448, 0.967],
+      "label": "lava"
+    }
+  }
+}

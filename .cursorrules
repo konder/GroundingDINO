@@ -1,0 +1,61 @@
+# GroundingDINO for Minecraft — Cursor Rules
+
+## 项目概述
+
+本项目基于 GroundingDINO 开放集目标检测模型，通过 MineStudio 等 Minecraft 领域数据进行微调，
+提升模型在 Minecraft 游戏画面上的目标检测准确性。
+
+## 开发规范
+
+### TDD（测试驱动开发）
+
+- 新增或修改代码前，先编写对应的测试用例
+- 测试文件放在 `tests/` 目录下，命名为 `test_<模块名>.py`
+- 完成代码后执行测试，未通过则返回修改
+- 使用 pytest 作为测试框架
+
+### 目录结构
+
+```
+GroundingDINO/
+├── groundingdino/         # 核心模型代码（上游 GroundingDINO）
+├── scripts/               # 数据处理、训练、评估脚本
+├── tests/                 # 测试代码
+├── data/
+│   ├── test/              # 手工标注测试集（入库）
+│   ├── raw/               # 原始数据（不入库）
+│   ├── processed/         # 预处理数据（不入库）
+│   ├── lmdb/              # LMDB 缓存（不入库）
+│   └── cache/             # 下载缓存（不入库）
+├── weights/               # 预训练权重（不入库）
+├── checkpoints/           # 训练检查点（不入库）
+├── logs/                  # 训练日志（不入库）
+├── runs/                  # TensorBoard/W&B 日志（不入库）
+└── demo/                  # 演示脚本
+```
+
+### 代码风格
+
+- Python 代码遵循 PEP 8
+- 类型注解：对公共 API 添加类型注解
+- 文档字符串：使用 Google 风格 docstring
+- 不添加多余的叙述性注释，仅在非显而易见的逻辑处添加解释
+
+### 数据规范
+
+- 大文件（权重、数据集、LMDB）不入 git，通过 .gitignore 排除
+- 数据转换脚本放在 `scripts/` 目录下
+- 测试数据放在 `data/test/`，随代码管理
+
+### 环境
+
+- Conda 环境名称：`dino`
+- Python: 3.x
+- 深度学习框架：PyTorch
+- HuggingFace 镜像：`https://hf-mirror.com`（HF_ENDPOINT 环境变量）
+
+### Git 规范
+
+- 不提交 `.env`、credentials、密钥等敏感文件
+- 不提交大于 10MB 的二进制文件
+- commit message 使用中文或英文均可，但需清晰描述变更内容
