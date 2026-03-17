@@ -48,6 +48,7 @@ class DetectionAnnotation:
     event_type: str            # raw event string
     episode_id: int
     frame_id: int              # global frame index in episode
+    seg_partition: str = ""    # segmentation LMDB partition path
 
 
 # ---------------------------------------------------------------------------
@@ -240,12 +241,14 @@ def read_episode_mapping(lmdb_path: str) -> Dict[int, str]:
     return mapping
 
 
-def build_episode_index(data_root: str) -> Dict[str, Dict[int, str]]:
-    """Build episode_idx → episode_name mapping for all LMDB partitions.
+def build_episode_index(data_root: str, source: str = "segmentation") -> Dict[str, Dict[int, str]]:
+    """Build episode_idx → episode_name mapping for LMDB partitions.
+
+    Reads from segmentation by default, since segmentation episode IDs
+    may differ from image/video episode IDs (different data partitions).
 
     Returns: {lmdb_path: {episode_idx: episode_name, ...}, ...}
     """
-    source = detect_video_source(data_root)
     index = {}
     for part_path in find_lmdb_parts(data_root, source):
         mapping = read_episode_mapping(part_path)
@@ -439,39 +442,68 @@ def build_image_index(data_root: str) -> Dict[str, List[str]]:
     return dict(index)
 
 
+def _point_near_center(
+    point: Optional[Tuple[int, int]],
+    center: Tuple[int, int],
+    threshold: float,
+    half_diag: float,
+) -> bool:
+    """Check if SAM2 tracking point is within threshold of screen center."""
+    if point is None:
+        return False
+    row, col = point
+    dist = ((row - center[0]) ** 2 + (col - center[1]) ** 2) ** 0.5
+    return dist / half_diag <= threshold
+
+
+def _find_event_boundaries(frames: List[dict]) -> Dict[str, Tuple[int, int]]:
+    """Find first/last frame index for each event type within a chunk.
+
+    Returns: {event_label: (first_frame_idx, last_frame_idx)}
+    """
+    boundaries: Dict[str, List[int]] = defaultdict(list)
+    for fi, frame_dict in enumerate(frames):
+        for event_key, event_val in frame_dict.items():
+            if not isinstance(event_key, tuple) or len(event_key) < 2:
+                continue
+            event_name = event_val.get("event", "")
+            label = parse_event_label(event_name)
+            if label is not None:
+                boundaries[label].append(fi)
+
+    return {
+        label: (min(indices), max(indices))
+        for label, indices in boundaries.items()
+    }
+
+
 def extract_annotations_from_segmentation(
     data_root: str,
     image_index: Dict[str, List[str]],
     mask_height: int = 360,
     mask_width: int = 640,
-    max_frames_per_chunk: int = 8,
+    center_threshold: float = 0.20,
+    event_window: int = 8,
 ) -> Tuple[List[DetectionAnnotation], Dict[str, set]]:
-    """Walk segmentation DB, extract annotations for frames that have matching images.
+    """Walk segmentation DB, extract high-quality annotations.
 
-    Only uses the first max_frames_per_chunk frames from each chunk.
-    Earlier frames in an event chunk are more likely to show the target object
-    intact (before it is broken/consumed), producing higher-quality bounding boxes.
+    Dual filtering strategy:
+    1. Temporal: only keep frames within `event_window` frames before each
+       event's last occurrence in the chunk (when the player is actively
+       targeting the object, right before it's mined/used/consumed).
+    2. Spatial: only keep frames where the SAM2 tracking point is within
+       `center_threshold` of screen center (player crosshair on target).
     """
     annotations: List[DetectionAnnotation] = []
     category_set: Dict[str, set] = defaultdict(set)
     ann_id = 0
+    skipped_off_center = 0
+    skipped_temporal = 0
 
-    partition_map = find_partition_mapping(data_root)
+    cy, cx = mask_height / 2, mask_width / 2
+    half_diag = (cy ** 2 + cx ** 2) ** 0.5
 
     for seg_path in find_lmdb_parts(data_root, "segmentation"):
-        matched_img_path = partition_map.get(seg_path)
-
-        img_keys_for_partition: Optional[set] = None
-        if matched_img_path:
-            img_env = lmdb.open(matched_img_path, readonly=True, lock=False,
-                                readahead=False, map_size=1024**3 * 100)
-            with img_env.begin() as img_txn:
-                img_keys_for_partition = {
-                    k.decode() for k, _ in img_txn.cursor()
-                    if not k.decode().startswith("__")
-                }
-            img_env.close()
-
         env = lmdb.open(seg_path, readonly=True, lock=False,
                         readahead=False, map_size=1024**3 * 100)
         with env.begin() as txn:
@@ -481,21 +513,14 @@ def extract_annotations_from_segmentation(
                 if key_str.startswith("__"):
                     continue
 
-                has_image = (
-                    (img_keys_for_partition and key_str in img_keys_for_partition)
-                    or key_str in image_index
-                )
-                if not has_image:
-                    continue
-
                 chunk_key = eval(key_str)  # (episode_id, frame_offset)
                 episode_id = chunk_key[0]
                 frame_offset = chunk_key[1]
                 frames = pickle.loads(val_raw)
 
+                event_bounds = _find_event_boundaries(frames)
+
                 for fi, frame_dict in enumerate(frames):
-                    if fi >= max_frames_per_chunk:
-                        break
                     for event_key, event_val in frame_dict.items():
                         if not isinstance(event_key, tuple) or len(event_key) < 2:
                             continue
@@ -509,6 +534,16 @@ def extract_annotations_from_segmentation(
                             continue
 
                         if not rle_str or not rle_str.strip():
+                            continue
+
+                        _, last_fi = event_bounds.get(label, (0, 31))
+                        if fi < last_fi - event_window or fi > last_fi:
+                            skipped_temporal += 1
+                            continue
+
+                        if not _point_near_center(point, (cy, cx),
+                                                  center_threshold, half_diag):
+                            skipped_off_center += 1
                             continue
 
                         h, w = mask_height, mask_width
@@ -526,6 +561,7 @@ def extract_annotations_from_segmentation(
                             event_type=event_name,
                             episode_id=episode_id,
                             frame_id=global_frame,
+                            seg_partition=seg_path,
                         )
                         annotations.append(ann)
                         category_set[label].add(ann_id)
@@ -533,6 +569,8 @@ def extract_annotations_from_segmentation(
 
         env.close()
 
+    print(f"  Skipped {skipped_temporal} annotations (outside event window)")
+    print(f"  Skipped {skipped_off_center} annotations (point too far from center)")
     return annotations, category_set
 
 
@@ -593,10 +631,9 @@ def to_coco_format(
             categories[ann.category] = cat_id
             cat_id += 1
 
-        chunk_offset = (ann.frame_id // 32) * 32
-        frame_in_chunk = ann.frame_id % 32
-        img_filename = f"ep{ann.episode_id}_f{ann.frame_id:06d}.png"
-        img_key = (ann.episode_id, ann.frame_id)
+        seg_part_name = Path(ann.seg_partition).name if ann.seg_partition else "unk"
+        img_filename = f"{seg_part_name}_ep{ann.episode_id}_f{ann.frame_id:06d}.png"
+        img_key = (ann.seg_partition, ann.episode_id, ann.frame_id)
 
         if img_key not in images:
             img_id = len(images) + 1
@@ -664,43 +701,43 @@ def build_dataset(
     mask_width: int = 640,
     max_visualize: int = 0,
     raw_video_dir: Optional[str] = None,
-    max_frames_per_chunk: int = 8,
+    center_threshold: float = 0.20,
+    event_window: int = 8,
 ) -> dict:
     """Main pipeline: build fine-tuning dataset from MineStudio LMDB.
 
-    If raw_video_dir is provided, frames are extracted from original MP4 files
-    at 640x360 resolution instead of from LMDB video/image chunks.
-    max_frames_per_chunk controls how many frames to take from each 32-frame
-    chunk (earlier frames have higher annotation quality).
+    Frames are extracted from raw MP4 files matching the segmentation
+    episode mapping (not the image LMDB, which may contain different episodes).
+    center_threshold + event_window jointly filter for high-quality annotations.
     """
     source = detect_video_source(data_root)
     use_raw = raw_video_dir is not None
 
-    print(f"[1/5] Building index from {data_root}/{source}/ ...")
+    print(f"[1/5] Building index ...")
     image_index = build_image_index(data_root)
-    partition_map = find_partition_mapping(data_root)
-    for sp, ip in partition_map.items():
-        print(f"  Partition: {Path(sp).name} ↔ {Path(ip).name}")
     print(f"  Source: {source}/ ({len(image_index)} chunk keys)")
 
-    episode_index: Dict[str, Dict[int, str]] = {}
+    seg_episode_index = build_episode_index(data_root, source="segmentation")
+    seg_total = sum(len(m) for m in seg_episode_index.values())
+    print(f"  Segmentation episode mappings: {seg_total} episodes across "
+          f"{len(seg_episode_index)} partitions")
+
     raw_video_index: Dict[str, str] = {}
     if use_raw:
         print(f"  Raw video dir: {raw_video_dir}")
         print(f"  Scanning for MP4 files ...")
         raw_video_index = build_raw_video_index(raw_video_dir)
         print(f"  Found {len(raw_video_index)} raw MP4 files")
-        episode_index = build_episode_index(data_root)
-        total_eps = sum(len(m) for m in episode_index.values())
-        print(f"  Episode mappings: {total_eps} episodes across {len(episode_index)} partitions")
-        matched = sum(1 for m in episode_index.values()
-                      for name in m.values() if name in raw_video_index)
-        print(f"  Episodes with raw video: {matched}/{total_eps}")
+        needed_names = set(n for m in seg_episode_index.values() for n in m.values())
+        matched = sum(1 for n in needed_names if n in raw_video_index)
+        print(f"  Episodes with raw video: {matched}/{len(needed_names)}")
 
-    print(f"[2/5] Extracting annotations from segmentation (first {max_frames_per_chunk} frames/chunk) ...")
+    print(f"[2/5] Extracting annotations from segmentation "
+          f"(center={center_threshold:.0%}, window={event_window}) ...")
     annotations, cat_stats = extract_annotations_from_segmentation(
         data_root, image_index, mask_height, mask_width,
-        max_frames_per_chunk=max_frames_per_chunk,
+        center_threshold=center_threshold,
+        event_window=event_window,
     )
     print(f"  Extracted {len(annotations)} annotations")
     print(f"  Categories: {', '.join(f'{k}({len(v)})' for k, v in sorted(cat_stats.items()))}")
@@ -716,24 +753,22 @@ def build_dataset(
     seen_frames = set()
     missing_videos: List[str] = []
 
-    # Build a flat episode_idx → episode_name lookup from all partitions
-    flat_episode_map: Dict[int, str] = {}
-    for part_map in episode_index.values():
-        flat_episode_map.update(part_map)
-
     for ann in annotations:
-        frame_key = (ann.episode_id, ann.frame_id)
+        frame_key = (ann.seg_partition, ann.episode_id, ann.frame_id)
         if frame_key in seen_frames:
             continue
         seen_frames.add(frame_key)
 
-        img_filename = f"ep{ann.episode_id}_f{ann.frame_id:06d}.png"
+        seg_part_name = Path(ann.seg_partition).name if ann.seg_partition else "unk"
+        img_filename = f"{seg_part_name}_ep{ann.episode_id}_f{ann.frame_id:06d}.png"
         img_path = os.path.join(output_dir, "images", img_filename)
 
         if use_raw:
-            ep_name = flat_episode_map.get(ann.episode_id)
+            part_mapping = seg_episode_index.get(ann.seg_partition, {})
+            ep_name = part_mapping.get(ann.episode_id)
             if not ep_name:
-                msg = f"episode_idx={ann.episode_id} (no mapping in __chunk_infos__)"
+                msg = (f"ep_id={ann.episode_id} in {seg_part_name} "
+                       f"(no mapping in __chunk_infos__)")
                 if msg not in missing_videos:
                     missing_videos.append(msg)
                     print(f"  MISS: {msg}")
@@ -742,7 +777,7 @@ def build_dataset(
 
             mp4_path = find_raw_video(raw_video_dir, ep_name)
             if not mp4_path:
-                msg = f"{ep_name}.mp4 (episode_idx={ann.episode_id})"
+                msg = f"{ep_name}.mp4 (ep_id={ann.episode_id} in {seg_part_name})"
                 if msg not in missing_videos:
                     missing_videos.append(msg)
                     print(f"  MISS: {msg}")
@@ -848,8 +883,12 @@ def main():
                         help="Number of samples to visualize (0 = none)")
     parser.add_argument("--raw-video-dir", default=None,
                         help="Path to raw VPT MP4 video files for 640x360 frame extraction")
-    parser.add_argument("--max-frames", type=int, default=8,
-                        help="Max frames per 32-frame chunk (earlier = higher quality, default: 8)")
+    parser.add_argument("--center-threshold", type=float, default=0.20,
+                        help="Max normalized distance from screen center for SAM2 point "
+                             "(0.15=strict, 0.20=default, 0.30=loose)")
+    parser.add_argument("--event-window", type=int, default=8,
+                        help="Take only the last N frames before each event's end in "
+                             "the 32-frame chunk (default: 8)")
 
     args = parser.parse_args()
 
@@ -860,7 +899,8 @@ def main():
         mask_width=args.mask_width,
         max_visualize=args.visualize,
         raw_video_dir=args.raw_video_dir,
-        max_frames_per_chunk=args.max_frames,
+        center_threshold=args.center_threshold,
+        event_window=args.event_window,
     )
 
     print("\n" + "=" * 60)

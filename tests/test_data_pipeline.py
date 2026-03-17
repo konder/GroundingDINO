@@ -381,3 +381,43 @@ class TestFindRawVideo:
         find_raw_video(str(tmp_path), "A")
         cache = find_raw_video.__defaults__[0]
         assert str(tmp_path) in cache
+
+
+class TestPointNearCenter:
+    """Test _point_near_center filter."""
+
+    def test_exact_center(self):
+        from scripts.build_finetune_dataset import _point_near_center
+        import math
+        center = (180, 320)
+        half_diag = math.sqrt(180**2 + 320**2)
+        assert _point_near_center((180, 320), center, 0.15, half_diag) is True
+
+    def test_near_center(self):
+        from scripts.build_finetune_dataset import _point_near_center
+        import math
+        center = (180, 320)
+        half_diag = math.sqrt(180**2 + 320**2)
+        assert _point_near_center((190, 330), center, 0.15, half_diag) is True
+
+    def test_far_from_center(self):
+        from scripts.build_finetune_dataset import _point_near_center
+        import math
+        center = (180, 320)
+        half_diag = math.sqrt(180**2 + 320**2)
+        assert _point_near_center((10, 10), center, 0.15, half_diag) is False
+
+    def test_none_point(self):
+        from scripts.build_finetune_dataset import _point_near_center
+        assert _point_near_center(None, (180, 320), 0.15, 366.6) is False
+
+    def test_threshold_boundary(self):
+        from scripts.build_finetune_dataset import _point_near_center
+        import math
+        center = (180, 320)
+        half_diag = math.sqrt(180**2 + 320**2)
+        dist_20pct = half_diag * 0.20
+        point = (180, 320 + int(dist_20pct) - 1)
+        assert _point_near_center(point, center, 0.20, half_diag) is True
+        point_far = (180, 320 + int(dist_20pct) + 5)
+        assert _point_near_center(point_far, center, 0.20, half_diag) is False

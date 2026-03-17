@@ -1,7 +1,8 @@
 """List raw MP4 video files needed for the fine-tuning dataset.
 
-Run on the production machine where both the aligned sample LMDB
-and the raw video directory are accessible.
+Uses SEGMENTATION partition's __chunk_infos__ (not image's) to resolve
+episode names, since segmentation and image partitions contain different
+episodes under the same episode_id.
 
 Usage:
     python scripts/list_needed_videos.py \
@@ -18,27 +19,53 @@ import os
 import pickle
 import sys
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, Set, Tuple
+
+
+def read_seg_episode_mapping(seg_path: str) -> Dict[int, str]:
+    """Read episode_idx → episode_name from a segmentation LMDB's __chunk_infos__."""
+    env = lmdb.open(seg_path, readonly=True, lock=False,
+                    readahead=False, map_size=1024**3 * 100)
+    mapping = {}
+    with env.begin() as txn:
+        raw = txn.get(b"__chunk_infos__")
+        if raw:
+            for info in pickle.loads(raw):
+                idx = info.get("episode_idx", info.get("idx"))
+                name = info.get("episode", "")
+                if idx is not None and name:
+                    mapping[idx] = name
+    env.close()
+    return mapping
 
 
 def main():
     parser = argparse.ArgumentParser(description="List raw MP4 files needed for fine-tuning")
     parser.add_argument("--data-root", required=True,
-                        help="Aligned MineStudio sample (with segmentation/, image/)")
+                        help="Aligned MineStudio sample (with segmentation/)")
     parser.add_argument("--raw-video-dir", required=True,
                         help="Root of raw VPT video files")
     parser.add_argument("-o", "--output", default="needed_videos.txt",
                         help="Output file for video paths")
     args = parser.parse_args()
 
-    data_root = args.data_root
+    seg_dir = Path(args.data_root) / "segmentation"
+    if not seg_dir.exists():
+        print(f"ERROR: {seg_dir} not found")
+        sys.exit(1)
 
-    # 1. Find episode IDs used in segmentation
-    seg_episode_ids: Set[int] = set()
-    seg_dir = Path(data_root) / "segmentation"
+    # 1. For each segmentation partition, find which episode IDs are used
+    #    and resolve them via THAT partition's __chunk_infos__
+    needed_names: Set[str] = set()
+    per_partition_info = []
+
     for part in sorted(seg_dir.iterdir()):
         if not part.is_dir() or not (part / "data.mdb").exists():
             continue
+
+        mapping = read_seg_episode_mapping(str(part))
+
+        ep_ids_in_data: Set[int] = set()
         env = lmdb.open(str(part), readonly=True, lock=False,
                         readahead=False, map_size=1024**3 * 100)
         with env.begin() as txn:
@@ -47,55 +74,53 @@ def main():
                 if key_str.startswith("__"):
                     continue
                 ep_id = eval(key_str)[0]
-                seg_episode_ids.add(ep_id)
+                ep_ids_in_data.add(ep_id)
         env.close()
-    print(f"Episode IDs in segmentation: {sorted(seg_episode_ids)}")
 
-    # 2. Read __chunk_infos__ from ALL source LMDBs to get episode_idx → name
-    id_to_name: Dict[int, str] = {}
-    for subdir in ["video", "image", "segmentation"]:
-        src_dir = Path(data_root) / subdir
-        if not src_dir.exists():
-            continue
-        for part in sorted(src_dir.iterdir()):
-            if not part.is_dir() or not (part / "data.mdb").exists():
-                continue
-            env = lmdb.open(str(part), readonly=True, lock=False,
-                            readahead=False, map_size=1024**3 * 100)
-            with env.begin() as txn:
-                raw = txn.get(b"__chunk_infos__")
-                if raw:
-                    for info in pickle.loads(raw):
-                        idx = info.get("episode_idx", info.get("idx"))
-                        name = info.get("episode", "")
-                        if idx is not None and name:
-                            id_to_name[idx] = name
-            env.close()
+        resolved = {}
+        missing_ids = []
+        for eid in sorted(ep_ids_in_data):
+            name = mapping.get(eid)
+            if name:
+                resolved[eid] = name
+                needed_names.add(name)
+            else:
+                missing_ids.append(eid)
 
-    print(f"Episode mappings found: {len(id_to_name)}")
+        info = {
+            "partition": part.name,
+            "chunk_infos_count": len(mapping),
+            "episode_ids_in_data": sorted(ep_ids_in_data),
+            "resolved": resolved,
+            "missing_ids": missing_ids,
+        }
+        per_partition_info.append(info)
 
-    needed_names = sorted(set(
-        id_to_name[eid] for eid in seg_episode_ids if eid in id_to_name
-    ))
-    print(f"Episodes needing raw video: {len(needed_names)}")
+        print(f"  {part.name}: {len(ep_ids_in_data)} episodes in data, "
+              f"{len(mapping)} in __chunk_infos__, "
+              f"{len(resolved)} resolved, {len(missing_ids)} missing")
+        for eid, name in sorted(resolved.items()):
+            print(f"    ep_id={eid} → {name}")
+        for eid in missing_ids:
+            print(f"    ep_id={eid} → ??? (not in __chunk_infos__)")
 
+    print(f"\nTotal unique episodes needed: {len(needed_names)}")
     if not needed_names:
-        print("ERROR: No episode name mappings found. "
-              "Re-run sample_aligned.py with the latest code to include __chunk_infos__.")
+        print("ERROR: No episode names resolved. Check __chunk_infos__ in segmentation LMDBs.")
         sys.exit(1)
 
-    # 3. Scan raw video dir to find full paths
-    print(f"Scanning {args.raw_video_dir} for MP4 files ...")
+    # 2. Scan raw video dir
+    print(f"\nScanning {args.raw_video_dir} for MP4 files ...")
     raw_index: Dict[str, str] = {}
     for mp4 in Path(args.raw_video_dir).rglob("*.mp4"):
         if mp4.stem not in raw_index:
             raw_index[mp4.stem] = str(mp4)
     print(f"  Found {len(raw_index)} MP4 files total")
 
-    # 4. Match and output
+    # 3. Match
     found = []
     missing = []
-    for name in needed_names:
+    for name in sorted(needed_names):
         path = raw_index.get(name)
         if path:
             found.append(path)
@@ -114,14 +139,18 @@ def main():
         for m in missing:
             print(f"  {m}.mp4")
 
-    # Also save a JSON with details
+    if found:
+        print(f"\nFound videos:")
+        for p in found:
+            print(f"  {p}")
+
     json_out = args.output.replace(".txt", ".json")
     with open(json_out, "w") as f:
         json.dump({
-            "episode_ids": sorted(seg_episode_ids),
-            "episode_names": needed_names,
+            "needed_episodes": sorted(needed_names),
             "found_paths": found,
             "missing": missing,
+            "per_partition": per_partition_info,
         }, f, indent=2)
     print(f"Details saved to {json_out}")
 
