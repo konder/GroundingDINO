@@ -27,17 +27,32 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 def find_partition_pairs(data_root: str) -> List[dict]:
-    """Find corresponding segmentation/image partition pairs.
+    """Find corresponding segmentation / video (or image) partition pairs.
 
-    MineStudio partitions are numbered similarly across data types:
-    seg/part-949 ↔ img/part-950, seg/part-1898 ↔ img/part-1900, etc.
+    Prefers video/ (640x360) over image/ (224x224).
+    MineStudio naming: seg/part-949 ↔ video/video-950, seg/part-1898 ↔ video/video-1900, etc.
     """
     root = Path(data_root)
     seg_dir = root / "segmentation"
+
+    if not seg_dir.exists():
+        print(f"ERROR: {seg_dir} not found")
+        sys.exit(1)
+
+    # Prefer video/ (640x360) over image/ (224x224)
+    vid_dir = root / "video"
     img_dir = root / "image"
 
-    if not seg_dir.exists() or not img_dir.exists():
-        print(f"ERROR: Need both {seg_dir} and {img_dir}")
+    if vid_dir.exists():
+        source_dir = vid_dir
+        source_type = "video"
+        print(f"Using video/ directory (640x360 original resolution)")
+    elif img_dir.exists():
+        source_dir = img_dir
+        source_type = "image"
+        print(f"Using image/ directory (224x224 resized)")
+    else:
+        print(f"ERROR: Need either {vid_dir} or {img_dir}")
         sys.exit(1)
 
     seg_parts = sorted([
@@ -45,22 +60,23 @@ def find_partition_pairs(data_root: str) -> List[dict]:
         if d.is_dir() and (d / "data.mdb").exists()
     ], key=lambda p: _part_num(p.name))
 
-    img_parts = sorted([
-        d for d in img_dir.iterdir()
+    src_parts = sorted([
+        d for d in source_dir.iterdir()
         if d.is_dir() and (d / "data.mdb").exists()
     ], key=lambda p: _part_num(p.name))
 
-    img_nums = {_part_num(p.name): p for p in img_parts}
+    src_nums = {_part_num(p.name): p for p in src_parts}
 
     pairs = []
     for sp in seg_parts:
         sp_num = _part_num(sp.name)
-        closest_num = min(img_nums.keys(), key=lambda n: abs(n - sp_num))
+        closest_num = min(src_nums.keys(), key=lambda n: abs(n - sp_num))
         pairs.append({
             "seg_path": str(sp),
-            "img_path": str(img_nums[closest_num]),
+            "img_path": str(src_nums[closest_num]),
             "seg_part": sp.name,
-            "img_part": img_nums[closest_num].name,
+            "img_part": src_nums[closest_num].name,
+            "source_type": source_type,
         })
 
     return pairs
@@ -129,16 +145,19 @@ def sample_aligned(
     num_samples: int = 50,
     events_only: bool = True,
 ) -> dict:
-    """Create aligned sample with matched segmentation + image data."""
+    """Create aligned sample with matched segmentation + video/image data."""
     pairs = find_partition_pairs(data_root)
-    print(f"Found {len(pairs)} segmentation/image partition pairs")
+    print(f"Found {len(pairs)} segmentation partition pairs")
 
     output_root = Path(output_dir)
     os.makedirs(output_root / "segmentation", exist_ok=True)
-    os.makedirs(output_root / "image", exist_ok=True)
+
+    source_type = pairs[0]["source_type"] if pairs else "video"
+    os.makedirs(output_root / source_type, exist_ok=True)
 
     manifest = {
         "source": data_root,
+        "source_type": source_type,
         "num_samples_per_partition": num_samples,
         "events_only": events_only,
         "partitions": [],
@@ -152,10 +171,10 @@ def sample_aligned(
         img_path = pair["img_path"]
         seg_part = pair["seg_part"]
         img_part = pair["img_part"]
+        stype = pair["source_type"]
 
-        print(f"\n--- {seg_part} ↔ {img_part} ---")
+        print(f"\n--- {seg_part} ↔ {img_part} ({stype}) ---")
 
-        # Find keys with events in segmentation
         event_keys = find_event_keys(seg_path, max_keys=num_samples,
                                      events_only=events_only)
         if not event_keys:
@@ -165,7 +184,6 @@ def sample_aligned(
         key_bytes_list = [ek[0] for ek in event_keys]
         print(f"  Found {len(key_bytes_list)} keys with events")
 
-        # Copy segmentation entries
         dst_seg = str(output_root / "segmentation" / seg_part)
         if os.path.exists(dst_seg):
             shutil.rmtree(dst_seg)
@@ -173,17 +191,17 @@ def sample_aligned(
         print(f"  Segmentation: copied {seg_copied} entries")
         total_seg += seg_copied
 
-        # Copy matching image entries
-        dst_img = str(output_root / "image" / img_part)
+        dst_img = str(output_root / stype / img_part)
         if os.path.exists(dst_img):
             shutil.rmtree(dst_img)
         img_copied = _copy_keys(img_path, dst_img, key_bytes_list)
-        print(f"  Image: copied {img_copied}/{len(key_bytes_list)} entries")
+        print(f"  {stype.capitalize()}: copied {img_copied}/{len(key_bytes_list)} entries")
         total_img += img_copied
 
         manifest["partitions"].append({
             "seg_part": seg_part,
             "img_part": img_part,
+            "source_type": stype,
             "event_keys": len(key_bytes_list),
             "seg_copied": seg_copied,
             "img_copied": img_copied,

@@ -169,6 +169,99 @@ def parse_event_label(event_str: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# LMDB episode metadata → raw video mapping
+# ---------------------------------------------------------------------------
+
+def read_episode_mapping(lmdb_path: str) -> Dict[int, str]:
+    """Read __chunk_infos__ from LMDB to get episode_idx → episode_name mapping.
+
+    MineStudio stores metadata in each LMDB partition:
+        __chunk_infos__ = [{'episode': 'Player249-...', 'episode_idx': 0, ...}, ...]
+    """
+    env = lmdb.open(lmdb_path, readonly=True, lock=False,
+                    readahead=False, map_size=1024**3 * 100)
+    mapping = {}
+    with env.begin() as txn:
+        raw = txn.get("__chunk_infos__".encode())
+        if raw:
+            chunk_infos = pickle.loads(raw)
+            for info in chunk_infos:
+                idx = info.get("episode_idx", info.get("idx"))
+                name = info.get("episode", "")
+                if idx is not None and name:
+                    mapping[idx] = name
+    env.close()
+    return mapping
+
+
+def build_episode_index(data_root: str) -> Dict[str, Dict[int, str]]:
+    """Build episode_idx → episode_name mapping for all LMDB partitions.
+
+    Returns: {lmdb_path: {episode_idx: episode_name, ...}, ...}
+    """
+    source = detect_video_source(data_root)
+    index = {}
+    for part_path in find_lmdb_parts(data_root, source):
+        mapping = read_episode_mapping(part_path)
+        if mapping:
+            index[part_path] = mapping
+    return index
+
+
+def build_raw_video_index(raw_video_dir: str) -> Dict[str, str]:
+    """Scan raw_video_dir recursively and build stem → full_path index.
+
+    Handles multi-level structures like:
+        raw_video_dir/all_6xx_Jun_29/data/6.0/Player249-xxx.mp4
+        raw_video_dir/all_6xx_Jun_29/data/6.13/Player100-yyy.mp4
+
+    Returns: {"Player249-xxx": "/full/path/Player249-xxx.mp4", ...}
+    """
+    raw_root = Path(raw_video_dir)
+    index: Dict[str, str] = {}
+    for mp4 in raw_root.rglob("*.mp4"):
+        stem = mp4.stem
+        if stem not in index:
+            index[stem] = str(mp4)
+    return index
+
+
+def find_raw_video(
+    raw_video_dir: str,
+    episode_name: str,
+    _index_cache: Dict[str, Dict[str, str]] = {},
+) -> Optional[str]:
+    """Find the raw MP4 file for an episode name using pre-built index.
+
+    The index is built once per raw_video_dir and cached for subsequent calls.
+    """
+    if raw_video_dir not in _index_cache:
+        _index_cache[raw_video_dir] = build_raw_video_index(raw_video_dir)
+    return _index_cache[raw_video_dir].get(episode_name)
+
+
+def decode_raw_video_frame(
+    video_path: str,
+    frame_index: int,
+    _cap_cache: Dict[str, cv2.VideoCapture] = {},
+) -> Optional[np.ndarray]:
+    """Extract a specific frame from a raw MP4 video file.
+
+    Returns BGR numpy array at original resolution (typically 640x360).
+    """
+    if video_path not in _cap_cache:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        _cap_cache[video_path] = cap
+
+    cap = _cap_cache[video_path]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+    ret, frame = cap.read()
+    return frame if ret else None
+
+
+# ---------------------------------------------------------------------------
 # Video chunk → frame extraction
 # ---------------------------------------------------------------------------
 
@@ -222,33 +315,45 @@ def _part_num(name: str) -> int:
         return 0
 
 
+def detect_video_source(data_root: str) -> str:
+    """Detect whether to use video/ (640x360) or image/ (224x224)."""
+    if find_lmdb_parts(data_root, "video"):
+        return "video"
+    return "image"
+
+
 def find_partition_mapping(data_root: str) -> Dict[str, str]:
-    """Map segmentation partition paths to closest image partition paths.
+    """Map segmentation partition paths to closest video/image partition paths.
 
     MineStudio uses nearly-matching part numbers across data types:
-    seg/part-949 ↔ img/part-950, seg/part-1898 ↔ img/part-1900, etc.
+    seg/part-949 ↔ video/video-950, seg/part-1898 ↔ video/video-1900, etc.
     """
+    source = detect_video_source(data_root)
     seg_parts = find_lmdb_parts(data_root, "segmentation")
-    img_parts = find_lmdb_parts(data_root, "image")
+    src_parts = find_lmdb_parts(data_root, source)
 
-    if not img_parts:
+    if not src_parts:
         return {}
 
-    img_by_num = {_part_num(Path(p).name): p for p in img_parts}
+    src_by_num = {_part_num(Path(p).name): p for p in src_parts}
     mapping = {}
 
     for sp in seg_parts:
         sp_num = _part_num(Path(sp).name)
-        closest_num = min(img_by_num.keys(), key=lambda n: abs(n - sp_num))
-        mapping[sp] = img_by_num[closest_num]
+        closest_num = min(src_by_num.keys(), key=lambda n: abs(n - sp_num))
+        mapping[sp] = src_by_num[closest_num]
 
     return mapping
 
 
 def build_image_index(data_root: str) -> Dict[str, List[str]]:
-    """Build an index: key_str → [image_lmdb_path, ...] for fast lookup."""
+    """Build an index: key_str → [lmdb_path, ...] for fast lookup.
+
+    Prefers video/ (640x360) over image/ (224x224).
+    """
+    source = detect_video_source(data_root)
     index: Dict[str, List[str]] = defaultdict(list)
-    for part_path in find_lmdb_parts(data_root, "image"):
+    for part_path in find_lmdb_parts(data_root, source):
         env = lmdb.open(part_path, readonly=True, lock=False,
                         readahead=False, map_size=1024**3 * 100)
         with env.begin() as txn:
@@ -470,14 +575,36 @@ def build_dataset(
     mask_height: int = 360,
     mask_width: int = 640,
     max_visualize: int = 0,
+    raw_video_dir: Optional[str] = None,
 ) -> dict:
-    """Main pipeline: build fine-tuning dataset from MineStudio LMDB."""
-    print(f"[1/5] Building image index from {data_root}/image/ ...")
+    """Main pipeline: build fine-tuning dataset from MineStudio LMDB.
+
+    If raw_video_dir is provided, frames are extracted from original MP4 files
+    at 640x360 resolution instead of from LMDB video/image chunks.
+    """
+    source = detect_video_source(data_root)
+    use_raw = raw_video_dir is not None
+
+    print(f"[1/5] Building index from {data_root}/{source}/ ...")
     image_index = build_image_index(data_root)
     partition_map = find_partition_mapping(data_root)
     for sp, ip in partition_map.items():
         print(f"  Partition: {Path(sp).name} ↔ {Path(ip).name}")
-    print(f"  Found {len(image_index)} image chunk keys")
+    print(f"  Source: {source}/ ({len(image_index)} chunk keys)")
+
+    episode_index: Dict[str, Dict[int, str]] = {}
+    raw_video_index: Dict[str, str] = {}
+    if use_raw:
+        print(f"  Raw video dir: {raw_video_dir}")
+        print(f"  Scanning for MP4 files ...")
+        raw_video_index = build_raw_video_index(raw_video_dir)
+        print(f"  Found {len(raw_video_index)} raw MP4 files")
+        episode_index = build_episode_index(data_root)
+        total_eps = sum(len(m) for m in episode_index.values())
+        print(f"  Episode mappings: {total_eps} episodes across {len(episode_index)} partitions")
+        matched = sum(1 for m in episode_index.values()
+                      for name in m.values() if name in raw_video_index)
+        print(f"  Episodes with raw video: {matched}/{total_eps}")
 
     print(f"[2/5] Extracting annotations from segmentation ...")
     annotations, cat_stats = extract_annotations_from_segmentation(
@@ -493,23 +620,66 @@ def build_dataset(
     print(f"[3/5] Exporting frame images to {output_dir}/images/ ...")
     os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
     exported = 0
+    skipped = 0
     seen_frames = set()
+    missing_videos: List[str] = []
+
+    # Build a flat episode_idx → episode_name lookup from all partitions
+    flat_episode_map: Dict[int, str] = {}
+    for part_map in episode_index.values():
+        flat_episode_map.update(part_map)
+
     for ann in annotations:
         frame_key = (ann.episode_id, ann.frame_id)
         if frame_key in seen_frames:
             continue
         seen_frames.add(frame_key)
 
-        chunk_offset = (ann.frame_id // 32) * 32
-        frame_in_chunk = ann.frame_id % 32
-        chunk_key_str = f"({ann.episode_id}, {chunk_offset})"
         img_filename = f"ep{ann.episode_id}_f{ann.frame_id:06d}.png"
         img_path = os.path.join(output_dir, "images", img_filename)
 
-        if export_frame_image(image_index, chunk_key_str, frame_in_chunk, img_path):
-            exported += 1
+        if use_raw:
+            ep_name = flat_episode_map.get(ann.episode_id)
+            if not ep_name:
+                msg = f"episode_idx={ann.episode_id} (no mapping in __chunk_infos__)"
+                if msg not in missing_videos:
+                    missing_videos.append(msg)
+                    print(f"  MISS: {msg}")
+                skipped += 1
+                continue
+
+            mp4_path = find_raw_video(raw_video_dir, ep_name)
+            if not mp4_path:
+                msg = f"{ep_name}.mp4 (episode_idx={ann.episode_id})"
+                if msg not in missing_videos:
+                    missing_videos.append(msg)
+                    print(f"  MISS: {msg}")
+                skipped += 1
+                continue
+
+            frame = decode_raw_video_frame(mp4_path, ann.frame_id)
+            if frame is not None:
+                cv2.imwrite(img_path, frame)
+                exported += 1
+            else:
+                print(f"  MISS: frame {ann.frame_id} decode failed in {ep_name}.mp4")
+                skipped += 1
+        else:
+            chunk_offset = (ann.frame_id // 32) * 32
+            frame_in_chunk = ann.frame_id % 32
+            chunk_key_str = f"({ann.episode_id}, {chunk_offset})"
+            if export_frame_image(image_index, chunk_key_str, frame_in_chunk, img_path):
+                exported += 1
+            else:
+                skipped += 1
 
     print(f"  Exported {exported}/{len(seen_frames)} frames")
+    if skipped > 0:
+        print(f"  Skipped: {skipped} frames")
+    if missing_videos:
+        print(f"  Missing videos ({len(missing_videos)}):")
+        for mv in missing_videos:
+            print(f"    - {mv}")
 
     # Detect actual image resolution from first exported image
     sample_img_path = os.path.join(output_dir, "images",
@@ -518,7 +688,7 @@ def build_dataset(
         sample_img = cv2.imread(sample_img_path)
         image_hw = (sample_img.shape[0], sample_img.shape[1])
     else:
-        image_hw = (224, 224)
+        image_hw = (360, 640) if use_raw else (224, 224)
     print(f"  Image resolution: {image_hw[1]}x{image_hw[0]}")
 
     print(f"[4/5] Generating COCO JSON ...")
@@ -551,6 +721,8 @@ def build_dataset(
     summary = {
         "data_root": data_root,
         "output_dir": output_dir,
+        "source": "raw_video" if use_raw else source,
+        "raw_video_dir": raw_video_dir,
         "mask_resolution": f"{mask_width}x{mask_height}",
         "image_resolution": f"{image_hw[1]}x{image_hw[0]}",
         "total_annotations": len(annotations),
@@ -558,6 +730,8 @@ def build_dataset(
         "categories": {c["name"]: sum(1 for a in coco["annotations"] if a["category_id"] == c["id"])
                        for c in coco["categories"]},
         "exported_frames": exported,
+        "skipped_frames": skipped,
+        "missing_videos": missing_videos if use_raw else [],
     }
     summary_path = os.path.join(output_dir, "summary.json")
     with open(summary_path, "w") as f:
@@ -580,6 +754,8 @@ def main():
                         help="Mask resolution width (default: 640)")
     parser.add_argument("--visualize", type=int, default=0,
                         help="Number of samples to visualize (0 = none)")
+    parser.add_argument("--raw-video-dir", default=None,
+                        help="Path to raw VPT MP4 video files for 640x360 frame extraction")
 
     args = parser.parse_args()
 
@@ -589,6 +765,7 @@ def main():
         mask_height=args.mask_height,
         mask_width=args.mask_width,
         max_visualize=args.visualize,
+        raw_video_dir=args.raw_video_dir,
     )
 
     print("\n" + "=" * 60)

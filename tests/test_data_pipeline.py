@@ -15,6 +15,9 @@ from scripts.build_finetune_dataset import (
     scale_bbox,
     DetectionAnnotation,
     to_coco_format,
+    read_episode_mapping,
+    build_raw_video_index,
+    find_raw_video,
 )
 
 
@@ -214,3 +217,118 @@ class TestInferMaskResolution:
     def test_empty(self):
         h, w = infer_mask_resolution("")
         assert (h, w) == (360, 640)
+
+
+# ---------------------------------------------------------------------------
+# read_episode_mapping
+# ---------------------------------------------------------------------------
+
+class TestReadEpisodeMapping:
+    def test_reads_chunk_infos(self, tmp_path):
+        """LMDB with __chunk_infos__ → episode_idx to episode_name mapping."""
+        import lmdb as _lmdb
+
+        lmdb_path = str(tmp_path / "test_lmdb")
+        env = _lmdb.open(lmdb_path, map_size=10 * 1024 * 1024)
+        chunk_infos = [
+            {"episode": "Player100-abc123-20210101-120000", "episode_idx": 0, "num_frames": 5000},
+            {"episode": "Player200-def456-20210202-130000", "episode_idx": 1, "num_frames": 3000},
+        ]
+        with env.begin(write=True) as txn:
+            txn.put("__chunk_infos__".encode(), pickle.dumps(chunk_infos))
+        env.close()
+
+        mapping = read_episode_mapping(lmdb_path)
+        assert mapping == {
+            0: "Player100-abc123-20210101-120000",
+            1: "Player200-def456-20210202-130000",
+        }
+
+    def test_empty_lmdb(self, tmp_path):
+        """LMDB without __chunk_infos__ → empty mapping."""
+        import lmdb as _lmdb
+
+        lmdb_path = str(tmp_path / "empty_lmdb")
+        env = _lmdb.open(lmdb_path, map_size=10 * 1024 * 1024)
+        env.close()
+
+        mapping = read_episode_mapping(lmdb_path)
+        assert mapping == {}
+
+
+# ---------------------------------------------------------------------------
+# find_raw_video
+# ---------------------------------------------------------------------------
+
+class TestBuildRawVideoIndex:
+    def test_flat_directory(self, tmp_path):
+        (tmp_path / "Player100-abc.mp4").write_bytes(b"fake")
+        (tmp_path / "Player200-def.mp4").write_bytes(b"fake")
+        index = build_raw_video_index(str(tmp_path))
+        assert "Player100-abc" in index
+        assert "Player200-def" in index
+        assert len(index) == 2
+
+    def test_nested_directories(self, tmp_path):
+        """Handles multi-level structures like all_6xx_Jun_29/data/6.0/xx.mp4"""
+        deep = tmp_path / "all_6xx_Jun_29" / "data" / "6.0"
+        deep.mkdir(parents=True)
+        (deep / "Player100-abc.mp4").write_bytes(b"fake")
+
+        deep2 = tmp_path / "all_6xx_Jun_29" / "data" / "6.13"
+        deep2.mkdir(parents=True)
+        (deep2 / "Player200-def.mp4").write_bytes(b"fake")
+
+        index = build_raw_video_index(str(tmp_path))
+        assert "Player100-abc" in index
+        assert "Player200-def" in index
+        assert "6.0" in index["Player100-abc"]
+        assert "6.13" in index["Player200-def"]
+
+    def test_empty_dir(self, tmp_path):
+        index = build_raw_video_index(str(tmp_path))
+        assert index == {}
+
+    def test_ignores_non_mp4(self, tmp_path):
+        (tmp_path / "data.txt").write_bytes(b"text")
+        (tmp_path / "video.avi").write_bytes(b"avi")
+        (tmp_path / "Player1.mp4").write_bytes(b"mp4")
+        index = build_raw_video_index(str(tmp_path))
+        assert len(index) == 1
+        assert "Player1" in index
+
+
+def _clear_raw_video_cache():
+    """Clear the mutable default dict cache in find_raw_video."""
+    cache = find_raw_video.__defaults__[0]
+    cache.clear()
+
+
+class TestFindRawVideo:
+    def test_direct_match(self, tmp_path):
+        mp4 = tmp_path / "Player100-abc.mp4"
+        mp4.write_bytes(b"fake")
+        _clear_raw_video_cache()
+        result = find_raw_video(str(tmp_path), "Player100-abc")
+        assert result == str(mp4)
+
+    def test_deep_nested_match(self, tmp_path):
+        deep = tmp_path / "all_6xx" / "data" / "6.0"
+        deep.mkdir(parents=True)
+        mp4 = deep / "Player100-abc.mp4"
+        mp4.write_bytes(b"fake")
+        _clear_raw_video_cache()
+        result = find_raw_video(str(tmp_path), "Player100-abc")
+        assert result == str(mp4)
+
+    def test_no_match(self, tmp_path):
+        _clear_raw_video_cache()
+        result = find_raw_video(str(tmp_path), "nonexistent")
+        assert result is None
+
+    def test_index_cached(self, tmp_path):
+        (tmp_path / "A.mp4").write_bytes(b"a")
+        _clear_raw_video_cache()
+        find_raw_video(str(tmp_path), "A")
+        cache = find_raw_video.__defaults__[0]
+        assert str(tmp_path) in cache
