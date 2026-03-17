@@ -17,7 +17,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAtte
 class BertModelWarper(nn.Module):
     def __init__(self, bert_model):
         super().__init__()
-        # self.bert = bert_modelc
 
         self.config = bert_model.config
         self.embeddings = bert_model.embeddings
@@ -26,7 +25,20 @@ class BertModelWarper(nn.Module):
 
         self.get_extended_attention_mask = bert_model.get_extended_attention_mask
         self.invert_attention_mask = bert_model.invert_attention_mask
-        self.get_head_mask = bert_model.get_head_mask
+        if hasattr(bert_model, "get_head_mask"):
+            self.get_head_mask = bert_model.get_head_mask
+        else:
+            self.get_head_mask = self._get_head_mask
+
+    @staticmethod
+    def _get_head_mask(head_mask, num_hidden_layers, is_attention_chunked=False):
+        """Fallback for transformers >= 5.x where get_head_mask was removed."""
+        if head_mask is not None:
+            head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+        else:
+            head_mask = [None] * num_hidden_layers
+        return head_mask
 
     def forward(
         self,
