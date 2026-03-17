@@ -253,8 +253,12 @@ def build_episode_index(data_root: str, source: str = "segmentation") -> Dict[st
 
     Returns: {lmdb_path: {episode_idx: episode_name, ...}, ...}
     """
+    parts = find_lmdb_parts(data_root, source)
     index = {}
-    for part_path in find_lmdb_parts(data_root, source):
+    for i, part_path in enumerate(parts):
+        if (i + 1) % 50 == 0 or i == 0:
+            print(f"    Scanning {source} partition {i + 1}/{len(parts)} ...",
+                  flush=True)
         mapping = read_episode_mapping(part_path)
         if mapping:
             index[part_path] = mapping
@@ -292,15 +296,20 @@ def build_raw_video_index(raw_video_dir: str) -> Dict[str, str]:
 
     raw_root = Path(raw_video_dir)
     index: Dict[str, str] = {}
+    count = 0
+    print(f"  Scanning {raw_video_dir} for MP4 files ...", flush=True)
     for mp4 in raw_root.rglob("*.mp4"):
         stem = mp4.stem
         if stem not in index:
             index[stem] = str(mp4)
+        count += 1
+        if count % 5000 == 0:
+            print(f"    Scanned {count} files ({len(index)} unique) ...", flush=True)
 
     try:
         with open(cache_file, "w") as f:
             json.dump(index, f)
-        print(f"  Saved index cache to {cache_file}")
+        print(f"  Saved index cache to {cache_file}", flush=True)
     except IOError:
         pass
 
@@ -662,7 +671,11 @@ def extract_annotations_from_segmentation(
     cy, cx = mask_height / 2, mask_width / 2
     half_diag = (cy ** 2 + cx ** 2) ** 0.5
 
-    for seg_path in find_lmdb_parts(data_root, "segmentation"):
+    seg_parts = find_lmdb_parts(data_root, "segmentation")
+    for seg_i, seg_path in enumerate(seg_parts):
+        if (seg_i + 1) % 20 == 0 or seg_i == 0:
+            print(f"    Processing partition {seg_i + 1}/{len(seg_parts)} "
+                  f"({len(annotations)} annotations so far) ...", flush=True)
         env = lmdb.open(seg_path, readonly=True, lock=False,
                         readahead=False, map_size=1024**3 * 100)
         with env.begin() as txn:
@@ -878,14 +891,19 @@ def build_dataset(
     source = detect_video_source(data_root)
     use_raw = raw_video_dir is not None
 
-    print(f"[1/5] Building index ...")
-    image_index = build_image_index(data_root)
-    print(f"  Source: {source}/ ({len(image_index)} chunk keys)")
+    print(f"[1/5] Building index ...", flush=True)
+
+    if use_raw:
+        image_index: Dict[str, List[str]] = {}
+        print(f"  Using raw video dir → skipping image/video LMDB index", flush=True)
+    else:
+        image_index = build_image_index(data_root)
+        print(f"  Source: {source}/ ({len(image_index)} chunk keys)", flush=True)
 
     seg_episode_index = build_episode_index(data_root, source="segmentation")
     seg_total = sum(len(m) for m in seg_episode_index.values())
     print(f"  Segmentation episode mappings: {seg_total} episodes across "
-          f"{len(seg_episode_index)} partitions")
+          f"{len(seg_episode_index)} partitions", flush=True)
 
     raw_video_index: Dict[str, str] = {}
     if use_raw:
@@ -921,14 +939,18 @@ def build_dataset(
         print("  WARNING: No annotations found. Check data alignment.")
         return {"annotations": 0}
 
-    print(f"[3/5] Exporting frame images to {output_dir}/images/ ...")
+    print(f"[3/5] Exporting frame images to {output_dir}/images/ ...", flush=True)
     os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
     exported = 0
     skipped = 0
     seen_frames = set()
     missing_videos: List[str] = []
+    n_total_anns = len(annotations)
 
-    for ann in annotations:
+    for ann_i, ann in enumerate(annotations):
+        if (ann_i + 1) % 500 == 0:
+            print(f"    Frame {ann_i + 1}/{n_total_anns} "
+                  f"(exported={exported}, skipped={skipped}) ...", flush=True)
         frame_key = (ann.seg_partition, ann.episode_id, ann.frame_id)
         if frame_key in seen_frames:
             continue
