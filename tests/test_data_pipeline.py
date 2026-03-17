@@ -1,4 +1,5 @@
 """Tests for scripts/build_finetune_dataset.py"""
+import cv2
 import json
 import numpy as np
 import os
@@ -15,10 +16,15 @@ from scripts.build_finetune_dataset import (
     parse_event_label,
     scale_bbox,
     DetectionAnnotation,
+    EpisodeChunkInfo,
     to_coco_format,
     read_episode_mapping,
     build_raw_video_index,
     find_raw_video,
+    _parse_episode_prefix,
+    build_episode_chunk_info,
+    _compute_mask_area,
+    detect_gui_frame,
 )
 
 
@@ -170,11 +176,39 @@ class TestParseEventLabel:
     def test_custom_open_chest(self):
         assert parse_event_label("custom:open_chest") is None
 
+    def test_craft_excluded_by_default(self):
+        assert parse_event_label("craft:crafting_table") is None
+        assert parse_event_label("craft:stone") is None
+
+    def test_extra_exclude(self):
+        assert parse_event_label("kill_entity:cow", exclude_actions={"kill_entity"}) is None
+        assert parse_event_label("mine_block:stone", exclude_actions={"kill_entity"}) == "stone"
+
     def test_empty(self):
         assert parse_event_label("") is None
 
     def test_none(self):
         assert parse_event_label(None) is None
+
+
+# ---------------------------------------------------------------------------
+# _compute_mask_area
+# ---------------------------------------------------------------------------
+
+class TestComputeMaskArea:
+    def test_empty(self):
+        assert _compute_mask_area("") == 0
+        assert _compute_mask_area("  ") == 0
+
+    def test_single_run(self):
+        assert _compute_mask_area("0 10") == 10
+
+    def test_multiple_runs(self):
+        assert _compute_mask_area("0 5 100 15 200 30") == 50
+
+    def test_typical_minecraft_mask(self):
+        area = _compute_mask_area("1000 500 5000 300 10000 200")
+        assert area == 1000
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +415,189 @@ class TestFindRawVideo:
         find_raw_video(str(tmp_path), "A")
         cache = find_raw_video.__defaults__[0]
         assert str(tmp_path) in cache
+
+
+# ---------------------------------------------------------------------------
+# Multi-chunk episode support
+# ---------------------------------------------------------------------------
+
+class TestParseEpisodePrefix:
+    def test_standard_name(self):
+        prefix, ts = _parse_episode_prefix("Player122-f153ac423f61-20211217-140509")
+        assert prefix == "Player122-f153ac423f61-20211217"
+        assert ts == "140509"
+
+    def test_no_timestamp(self):
+        prefix, ts = _parse_episode_prefix("Player122-abc")
+        assert prefix == "Player122-abc"
+        assert ts == ""
+
+    def test_single_word(self):
+        prefix, ts = _parse_episode_prefix("episode")
+        assert prefix == "episode"
+        assert ts == ""
+
+
+class TestEpisodeChunkInfo:
+    def test_resolve_first_chunk(self):
+        info = EpisodeChunkInfo(
+            chunks=[("/a.mp4", 1201), ("/b.mp4", 1201), ("/c.mp4", 1201)],
+            cumulative=[0, 1201, 2402, 3603],
+        )
+        assert info.total_frames == 3603
+        result = info.resolve_frame(0)
+        assert result == ("/a.mp4", 0)
+        result = info.resolve_frame(1200)
+        assert result == ("/a.mp4", 1200)
+
+    def test_resolve_second_chunk(self):
+        info = EpisodeChunkInfo(
+            chunks=[("/a.mp4", 1201), ("/b.mp4", 1201)],
+            cumulative=[0, 1201, 2402],
+        )
+        result = info.resolve_frame(1201)
+        assert result == ("/b.mp4", 0)
+        result = info.resolve_frame(1500)
+        assert result == ("/b.mp4", 299)
+
+    def test_resolve_last_frame(self):
+        info = EpisodeChunkInfo(
+            chunks=[("/a.mp4", 1201), ("/b.mp4", 1201)],
+            cumulative=[0, 1201, 2402],
+        )
+        result = info.resolve_frame(2401)
+        assert result == ("/b.mp4", 1200)
+
+    def test_out_of_range(self):
+        info = EpisodeChunkInfo(
+            chunks=[("/a.mp4", 1201)],
+            cumulative=[0, 1201],
+        )
+        assert info.resolve_frame(1201) is None
+        assert info.resolve_frame(-1) is None
+
+    def test_uneven_chunks(self):
+        info = EpisodeChunkInfo(
+            chunks=[("/a.mp4", 1201), ("/b.mp4", 800)],
+            cumulative=[0, 1201, 2001],
+        )
+        assert info.total_frames == 2001
+        assert info.resolve_frame(1500) == ("/b.mp4", 299)
+        assert info.resolve_frame(2000) == ("/b.mp4", 799)
+        assert info.resolve_frame(2001) is None
+
+
+class TestBuildEpisodeChunkInfo:
+    def test_single_chunk(self, tmp_path):
+        import cv2
+        _clear_episode_chunk_cache()
+        mp4 = tmp_path / "Player100-abc-20210101-120000.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(mp4), fourcc, 20, (64, 36))
+        for _ in range(100):
+            writer.write(np.zeros((36, 64, 3), dtype=np.uint8))
+        writer.release()
+
+        index = {mp4.stem: str(mp4)}
+        info = build_episode_chunk_info(index, "Player100-abc-20210101-120000")
+        assert info is not None
+        assert len(info.chunks) == 1
+        assert info.total_frames == 100
+
+    def test_multi_chunk(self, tmp_path):
+        import cv2
+        _clear_episode_chunk_cache()
+
+        stems = [
+            "Player100-abc-20210101-120000",
+            "Player100-abc-20210101-120100",
+            "Player100-abc-20210101-120200",
+        ]
+        index = {}
+        for stem in stems:
+            mp4 = tmp_path / f"{stem}.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(mp4), fourcc, 20, (64, 36))
+            for _ in range(50):
+                writer.write(np.zeros((36, 64, 3), dtype=np.uint8))
+            writer.release()
+            index[stem] = str(mp4)
+
+        info = build_episode_chunk_info(index, "Player100-abc-20210101-120000")
+        assert info is not None
+        assert len(info.chunks) == 3
+        assert info.total_frames == 150
+        assert info.resolve_frame(0) is not None
+        assert info.resolve_frame(50) is not None  # second chunk
+        assert info.resolve_frame(100) is not None  # third chunk
+        assert info.resolve_frame(149) is not None
+        assert info.resolve_frame(150) is None
+
+    def test_skips_earlier_chunks(self, tmp_path):
+        """Only includes chunks at or after the episode start timestamp."""
+        import cv2
+        _clear_episode_chunk_cache()
+
+        stems = [
+            "Player100-abc-20210101-110000",  # before start
+            "Player100-abc-20210101-120000",  # episode start
+            "Player100-abc-20210101-120100",  # after start
+        ]
+        index = {}
+        for stem in stems:
+            mp4 = tmp_path / f"{stem}.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(mp4), fourcc, 20, (64, 36))
+            for _ in range(50):
+                writer.write(np.zeros((36, 64, 3), dtype=np.uint8))
+            writer.release()
+            index[stem] = str(mp4)
+
+        info = build_episode_chunk_info(index, "Player100-abc-20210101-120000")
+        assert info is not None
+        assert len(info.chunks) == 2  # only 120000 and 120100
+
+    def test_no_matching_chunks(self, tmp_path):
+        _clear_episode_chunk_cache()
+        info = build_episode_chunk_info({}, "Player999-xxx-20210101-120000")
+        assert info is None
+
+
+def _clear_episode_chunk_cache():
+    """Clear the mutable default dict cache in build_episode_chunk_info."""
+    cache = build_episode_chunk_info.__defaults__[0]
+    cache.clear()
+
+
+class TestDetectGuiFrame:
+    def test_dark_frame_no_gui(self, tmp_path):
+        """A dark game frame should not be detected as GUI."""
+        img = np.zeros((360, 640, 3), dtype=np.uint8)
+        img[:] = 30  # dark
+        path = str(tmp_path / "dark.png")
+        cv2.imwrite(path, img)
+        assert detect_gui_frame(path) is False
+
+    def test_gui_frame(self, tmp_path):
+        """A frame with a bright gray center panel should be detected as GUI."""
+        img = np.zeros((360, 640, 3), dtype=np.uint8)
+        img[:] = 20  # dark background
+        # Add GUI panel: gray rectangle in center
+        img[40:250, 130:510] = 190  # Minecraft GUI gray
+        path = str(tmp_path / "gui.png")
+        cv2.imwrite(path, img)
+        assert detect_gui_frame(path) is True
+
+    def test_stone_cave_no_gui(self, tmp_path):
+        """A cave with varied gray textures should not trigger GUI detection."""
+        rng = np.random.RandomState(42)
+        img = rng.randint(10, 80, (360, 640, 3), dtype=np.uint8)
+        path = str(tmp_path / "cave.png")
+        cv2.imwrite(path, img)
+        assert detect_gui_frame(path) is False
+
+    def test_missing_file(self, tmp_path):
+        assert detect_gui_frame(str(tmp_path / "nonexistent.png")) is False
 
 
 class TestPointNearCenter:

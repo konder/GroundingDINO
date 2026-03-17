@@ -183,19 +183,24 @@ EVENT_LABEL_MAP = {
 }
 
 
-def parse_event_label(event_str: str) -> Optional[str]:
+SKIP_ACTIONS = {"custom", "open_chest", "craft"}
+
+
+def parse_event_label(event_str: str, exclude_actions: Optional[set] = None) -> Optional[str]:
     """Extract a human-readable category label from a Minecraft event string.
 
     Examples:
         'mine_block:coal_ore'       → 'coal_ore'
         'minecraft.mine_block:minecraft.coal_ore' → 'coal_ore'
-        'custom:open_chest'         → 'chest'
+        'craft:crafting_table'      → None (craft excluded by default)
+        'custom:open_chest'         → None
         'right_click'               → None (too generic)
         'landmark'                  → None (no specific object)
     """
     if not event_str:
         return None
 
+    skip = SKIP_ACTIONS | (exclude_actions or set())
     s = event_str.replace("minecraft.", "")
 
     if ":" in s:
@@ -203,13 +208,12 @@ def parse_event_label(event_str: str) -> Optional[str]:
         action = parts[0]
         target = parts[-1]
 
-        skip_actions = {"custom", "open_chest"}
-        if action in skip_actions:
+        if action in skip:
             return None
 
         return target.strip()
 
-    if s in ("right_click", "landmark", "attack"):
+    if s in ("right_click", "landmark", "attack", "craft"):
         return None
 
     return s.strip() or None
@@ -336,6 +340,123 @@ def decode_raw_video_frame(
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
     ret, frame = cap.read()
     return frame if ret else None
+
+
+# ---------------------------------------------------------------------------
+# Multi-chunk episode support
+# ---------------------------------------------------------------------------
+
+def _parse_episode_prefix(episode_name: str) -> Tuple[str, str]:
+    """Parse episode name into (session_prefix, start_timestamp).
+
+    VPT recordings are split into ~60-second chunks with names like:
+        Player122-f153ac423f61-20211217-140509
+    The session prefix is everything up to the last hyphen-separated
+    timestamp, and the start timestamp identifies this session's first chunk.
+
+    Returns ('Player122-f153ac423f61-20211217', '140509')
+    """
+    parts = episode_name.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0], parts[1]
+    return episode_name, ""
+
+
+@dataclass
+class EpisodeChunkInfo:
+    """Ordered chunks that compose a multi-chunk VPT episode."""
+    chunks: List[Tuple[str, int]]   # [(chunk_path, num_frames), ...]
+    cumulative: List[int]           # [0, n1, n1+n2, ...] prefix sums
+
+    @property
+    def total_frames(self) -> int:
+        return self.cumulative[-1] if len(self.cumulative) > 1 else 0
+
+    def resolve_frame(self, global_frame: int) -> Optional[Tuple[str, int]]:
+        """Map global frame index → (chunk_path, local_frame_index)."""
+        if global_frame < 0 or global_frame >= self.total_frames:
+            return None
+        import bisect
+        idx = bisect.bisect_right(self.cumulative, global_frame) - 1
+        if idx < 0 or idx >= len(self.chunks):
+            return None
+        return self.chunks[idx][0], global_frame - self.cumulative[idx]
+
+
+def build_episode_chunk_info(
+    raw_video_index: Dict[str, str],
+    episode_name: str,
+    _cache: Dict[str, Optional[EpisodeChunkInfo]] = {},
+) -> Optional[EpisodeChunkInfo]:
+    """Build ordered chunk list for a multi-chunk VPT episode.
+
+    VPT splits player sessions into ~60-second (1201 frame) MP4 chunks.
+    MineStudio stitches these into a single episode with continuous
+    frame numbering.  This function finds all chunks belonging to an
+    episode, reads their actual frame counts, and builds a cumulative
+    offset table for O(log n) frame-to-chunk resolution.
+    """
+    if episode_name in _cache:
+        return _cache[episode_name]
+
+    prefix, start_ts = _parse_episode_prefix(episode_name)
+
+    candidates: List[Tuple[str, str, str]] = []   # (timestamp, stem, path)
+    for stem, path in raw_video_index.items():
+        if stem.startswith(prefix + "-"):
+            ts = stem.rsplit("-", 1)[-1]
+            if ts >= start_ts:
+                candidates.append((ts, stem, path))
+
+    if not candidates:
+        _cache[episode_name] = None
+        return None
+
+    candidates.sort()
+
+    chunks: List[Tuple[str, int]] = []
+    cumulative = [0]
+    for _, _, path in candidates:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            continue
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        if n <= 0:
+            continue
+        chunks.append((path, n))
+        cumulative.append(cumulative[-1] + n)
+
+    if not chunks:
+        _cache[episode_name] = None
+        return None
+
+    info = EpisodeChunkInfo(chunks=chunks, cumulative=cumulative)
+    _cache[episode_name] = info
+    return info
+
+
+def decode_multichunk_frame(
+    raw_video_index: Dict[str, str],
+    episode_name: str,
+    global_frame: int,
+) -> Optional[np.ndarray]:
+    """Decode a frame from a (possibly multi-chunk) VPT episode.
+
+    Resolves the global frame index to the correct chunk file and local
+    offset, then extracts the frame.  Chunk metadata is cached so
+    subsequent calls for the same episode skip the scan.
+    """
+    info = build_episode_chunk_info(raw_video_index, episode_name)
+    if info is None:
+        return None
+
+    resolved = info.resolve_frame(global_frame)
+    if resolved is None:
+        return None
+
+    chunk_path, local_frame = resolved
+    return decode_raw_video_frame(chunk_path, local_frame)
 
 
 # ---------------------------------------------------------------------------
@@ -477,29 +598,67 @@ def _find_event_boundaries(frames: List[dict]) -> Dict[str, Tuple[int, int]]:
     }
 
 
+def detect_gui_frame(
+    img_path: str,
+    gui_threshold: float = 0.20,
+) -> bool:
+    """Detect if a Minecraft frame has an open GUI (inventory/crafting/furnace).
+
+    Minecraft GUIs render a semi-transparent gray panel in the center of the
+    screen. We check the center ROI for the ratio of gray pixels with
+    characteristic brightness (130-220) and low color variance (<20).
+
+    Returns True if the frame likely contains a GUI overlay.
+    """
+    img = cv2.imread(img_path)
+    if img is None:
+        return False
+    h, w = img.shape[:2]
+    roi = img[int(h * 0.1):int(h * 0.7), int(w * 0.2):int(w * 0.8)]
+    gray_diff = np.max(roi.astype(np.int16), axis=2) - np.min(roi.astype(np.int16), axis=2)
+    brightness = np.mean(roi, axis=2)
+    gray_mask = (gray_diff < 20) & (brightness > 130) & (brightness < 220)
+    gray_ratio = gray_mask.sum() / gray_mask.size
+    return bool(gray_ratio >= gui_threshold)
+
+
+def _compute_mask_area(rle_str: str) -> int:
+    """Count the number of foreground pixels in an RLE mask."""
+    if not rle_str or not rle_str.strip():
+        return 0
+    parts = list(map(int, rle_str.split()))
+    return sum(parts[i + 1] for i in range(0, len(parts), 2) if i + 1 < len(parts))
+
+
 def extract_annotations_from_segmentation(
     data_root: str,
     image_index: Dict[str, List[str]],
     mask_height: int = 360,
     mask_width: int = 640,
-    center_threshold: float = 0.20,
-    event_window: int = 8,
+    min_mask_area: int = 5000,
+    max_mask_area: float = 0.5,
+    center_threshold: float = 0.0,
 ) -> Tuple[List[DetectionAnnotation], Dict[str, set]]:
-    """Walk segmentation DB, extract high-quality annotations.
+    """Walk segmentation DB, extract annotations filtered by mask quality.
 
-    Dual filtering strategy:
-    1. Temporal: only keep frames within `event_window` frames before each
-       event's last occurrence in the chunk (when the player is actively
-       targeting the object, right before it's mined/used/consumed).
-    2. Spatial: only keep frames where the SAM2 tracking point is within
-       `center_threshold` of screen center (player crosshair on target).
+    Filtering strategy (replaces temporal window):
+    1. Mask area: only keep frames where the SAM2 mask covers at least
+       `min_mask_area` pixels (filters post-break residuals and GUI icons)
+       and at most `max_mask_area` fraction of the image (filters runaway
+       masks that cover the whole screen).
+    2. Spatial (optional): if `center_threshold` > 0, also require the
+       SAM2 tracking point to be within that fraction of screen center.
     """
     annotations: List[DetectionAnnotation] = []
     category_set: Dict[str, set] = defaultdict(set)
     ann_id = 0
+    skipped_small_mask = 0
+    skipped_large_mask = 0
     skipped_off_center = 0
-    skipped_temporal = 0
+    total_pixels = mask_height * mask_width
+    max_pixels = int(total_pixels * max_mask_area)
 
+    use_center_filter = center_threshold > 0
     cy, cx = mask_height / 2, mask_width / 2
     half_diag = (cy ** 2 + cx ** 2) ** 0.5
 
@@ -518,8 +677,6 @@ def extract_annotations_from_segmentation(
                 frame_offset = chunk_key[1]
                 frames = pickle.loads(val_raw)
 
-                event_bounds = _find_event_boundaries(frames)
-
                 for fi, frame_dict in enumerate(frames):
                     for event_key, event_val in frame_dict.items():
                         if not isinstance(event_key, tuple) or len(event_key) < 2:
@@ -536,13 +693,17 @@ def extract_annotations_from_segmentation(
                         if not rle_str or not rle_str.strip():
                             continue
 
-                        _, last_fi = event_bounds.get(label, (0, 31))
-                        if fi < last_fi - event_window or fi > last_fi:
-                            skipped_temporal += 1
+                        raw_area = _compute_mask_area(rle_str)
+                        if raw_area < min_mask_area:
+                            skipped_small_mask += 1
                             continue
 
-                        if not _point_near_center(point, (cy, cx),
-                                                  center_threshold, half_diag):
+                        if raw_area > max_pixels:
+                            skipped_large_mask += 1
+                            continue
+
+                        if use_center_filter and not _point_near_center(
+                                point, (cy, cx), center_threshold, half_diag):
                             skipped_off_center += 1
                             continue
 
@@ -569,8 +730,10 @@ def extract_annotations_from_segmentation(
 
         env.close()
 
-    print(f"  Skipped {skipped_temporal} annotations (outside event window)")
-    print(f"  Skipped {skipped_off_center} annotations (point too far from center)")
+    print(f"  Skipped {skipped_small_mask} annotations (mask < {min_mask_area}px)")
+    print(f"  Skipped {skipped_large_mask} annotations (mask > {max_mask_area:.0%} of image)")
+    if use_center_filter:
+        print(f"  Skipped {skipped_off_center} annotations (point too far from center)")
     return annotations, category_set
 
 
@@ -701,14 +864,16 @@ def build_dataset(
     mask_width: int = 640,
     max_visualize: int = 0,
     raw_video_dir: Optional[str] = None,
-    center_threshold: float = 0.20,
-    event_window: int = 8,
+    min_mask_area: int = 5000,
+    max_mask_area: float = 0.5,
+    center_threshold: float = 0.0,
+    filter_gui: bool = True,
 ) -> dict:
     """Main pipeline: build fine-tuning dataset from MineStudio LMDB.
 
     Frames are extracted from raw MP4 files matching the segmentation
     episode mapping (not the image LMDB, which may contain different episodes).
-    center_threshold + event_window jointly filter for high-quality annotations.
+    Mask area filtering + GUI detection for quality control.
     """
     source = detect_video_source(data_root)
     use_raw = raw_video_dir is not None
@@ -729,15 +894,25 @@ def build_dataset(
         raw_video_index = build_raw_video_index(raw_video_dir)
         print(f"  Found {len(raw_video_index)} raw MP4 files")
         needed_names = set(n for m in seg_episode_index.values() for n in m.values())
-        matched = sum(1 for n in needed_names if n in raw_video_index)
-        print(f"  Episodes with raw video: {matched}/{len(needed_names)}")
+        matched = 0
+        total_chunks = 0
+        for n in needed_names:
+            chunk_info = build_episode_chunk_info(raw_video_index, n)
+            if chunk_info and chunk_info.total_frames > 0:
+                matched += 1
+                total_chunks += len(chunk_info.chunks)
+        build_episode_chunk_info.__defaults__[0].clear()
+        print(f"  Episodes with raw video: {matched}/{len(needed_names)} "
+              f"({total_chunks} total chunks)")
 
     print(f"[2/5] Extracting annotations from segmentation "
-          f"(center={center_threshold:.0%}, window={event_window}) ...")
+          f"(mask_area={min_mask_area}-{max_mask_area:.0%}"
+          f"{f', center={center_threshold:.0%}' if center_threshold > 0 else ''}) ...")
     annotations, cat_stats = extract_annotations_from_segmentation(
         data_root, image_index, mask_height, mask_width,
+        min_mask_area=min_mask_area,
+        max_mask_area=max_mask_area,
         center_threshold=center_threshold,
-        event_window=event_window,
     )
     print(f"  Extracted {len(annotations)} annotations")
     print(f"  Categories: {', '.join(f'{k}({len(v)})' for k, v in sorted(cat_stats.items()))}")
@@ -775,21 +950,23 @@ def build_dataset(
                 skipped += 1
                 continue
 
-            mp4_path = find_raw_video(raw_video_dir, ep_name)
-            if not mp4_path:
-                msg = f"{ep_name}.mp4 (ep_id={ann.episode_id} in {seg_part_name})"
+            chunk_info = build_episode_chunk_info(raw_video_index, ep_name)
+            if chunk_info is None:
+                msg = f"{ep_name} (no matching chunks found)"
                 if msg not in missing_videos:
                     missing_videos.append(msg)
                     print(f"  MISS: {msg}")
                 skipped += 1
                 continue
 
-            frame = decode_raw_video_frame(mp4_path, ann.frame_id)
+            frame = decode_multichunk_frame(raw_video_index, ep_name, ann.frame_id)
             if frame is not None:
                 cv2.imwrite(img_path, frame)
                 exported += 1
             else:
-                print(f"  MISS: frame {ann.frame_id} decode failed in {ep_name}.mp4")
+                total = chunk_info.total_frames
+                print(f"  MISS: frame {ann.frame_id} (total={total}) "
+                      f"in {ep_name} ({len(chunk_info.chunks)} chunks)")
                 skipped += 1
         else:
             chunk_offset = (ann.frame_id // 32) * 32
@@ -809,14 +986,41 @@ def build_dataset(
             print(f"    - {mv}")
 
     # Detect actual image resolution from first exported image
-    sample_img_path = os.path.join(output_dir, "images",
-                                   f"ep{annotations[0].episode_id}_f{annotations[0].frame_id:06d}.png")
-    if os.path.exists(sample_img_path):
-        sample_img = cv2.imread(sample_img_path)
-        image_hw = (sample_img.shape[0], sample_img.shape[1])
-    else:
-        image_hw = (360, 640) if use_raw else (224, 224)
+    image_hw = (360, 640) if use_raw else (224, 224)
+    img_dir = os.path.join(output_dir, "images")
+    exported_imgs = [f for f in os.listdir(img_dir) if f.endswith(".png")] if os.path.isdir(img_dir) else []
+    if exported_imgs:
+        sample_img = cv2.imread(os.path.join(img_dir, exported_imgs[0]))
+        if sample_img is not None:
+            image_hw = (sample_img.shape[0], sample_img.shape[1])
     print(f"  Image resolution: {image_hw[1]}x{image_hw[0]}")
+
+    # GUI detection: remove frames with Minecraft GUI overlay
+    gui_removed = 0
+    if filter_gui:
+        pre_count = len(annotations)
+        kept = []
+        gui_frame_keys = set()
+        for ann in annotations:
+            seg_pn = Path(ann.seg_partition).name if ann.seg_partition else "unk"
+            img_filename = f"{seg_pn}_ep{ann.episode_id}_f{ann.frame_id:06d}.png"
+            img_path = os.path.join(img_dir, img_filename)
+            fk = (ann.seg_partition, ann.episode_id, ann.frame_id)
+            if fk in gui_frame_keys:
+                continue
+            if os.path.exists(img_path) and detect_gui_frame(img_path):
+                gui_frame_keys.add(fk)
+                os.remove(img_path)
+                exported -= 1
+            else:
+                kept.append(ann)
+        gui_removed = pre_count - len(kept)
+        annotations = kept
+        cat_stats = defaultdict(set)
+        for i, ann in enumerate(annotations):
+            cat_stats[ann.category].add(i)
+        print(f"  GUI filter removed {gui_removed} annotations "
+              f"({len(gui_frame_keys)} frames deleted)")
 
     print(f"[4/5] Generating COCO JSON ...")
     coco = to_coco_format(annotations, image_hw, (mask_height, mask_width))
@@ -832,8 +1036,11 @@ def build_dataset(
         vis_dir = os.path.join(output_dir, "vis")
         os.makedirs(vis_dir, exist_ok=True)
         count = 0
-        for ann in annotations[:max_visualize]:
-            img_filename = f"ep{ann.episode_id}_f{ann.frame_id:06d}.png"
+        for ann in annotations:
+            if count >= max_visualize:
+                break
+            seg_pn = Path(ann.seg_partition).name if ann.seg_partition else "unk"
+            img_filename = f"{seg_pn}_ep{ann.episode_id}_f{ann.frame_id:06d}.png"
             img_path = os.path.join(output_dir, "images", img_filename)
             if not os.path.exists(img_path):
                 continue
@@ -858,6 +1065,7 @@ def build_dataset(
                        for c in coco["categories"]},
         "exported_frames": exported,
         "skipped_frames": skipped,
+        "gui_removed": gui_removed,
         "missing_videos": missing_videos if use_raw else [],
     }
     summary_path = os.path.join(output_dir, "summary.json")
@@ -883,12 +1091,17 @@ def main():
                         help="Number of samples to visualize (0 = none)")
     parser.add_argument("--raw-video-dir", default=None,
                         help="Path to raw VPT MP4 video files for 640x360 frame extraction")
-    parser.add_argument("--center-threshold", type=float, default=0.20,
-                        help="Max normalized distance from screen center for SAM2 point "
-                             "(0.15=strict, 0.20=default, 0.30=loose)")
-    parser.add_argument("--event-window", type=int, default=8,
-                        help="Take only the last N frames before each event's end in "
-                             "the 32-frame chunk (default: 8)")
+    parser.add_argument("--min-mask-area", type=int, default=5000,
+                        help="Minimum mask area in pixels to keep an annotation "
+                             "(filters post-break residuals and GUI icons, default: 5000)")
+    parser.add_argument("--max-mask-area", type=float, default=0.5,
+                        help="Maximum mask area as fraction of image "
+                             "(filters runaway full-screen masks, default: 0.5)")
+    parser.add_argument("--center-threshold", type=float, default=0.0,
+                        help="Optional: max normalized distance from screen center "
+                             "for SAM2 point (0=disabled, 0.20=moderate, 0.30=loose)")
+    parser.add_argument("--no-gui-filter", action="store_true",
+                        help="Disable pixel-based GUI frame detection and removal")
 
     args = parser.parse_args()
 
@@ -899,8 +1112,10 @@ def main():
         mask_width=args.mask_width,
         max_visualize=args.visualize,
         raw_video_dir=args.raw_video_dir,
+        min_mask_area=args.min_mask_area,
+        max_mask_area=args.max_mask_area,
         center_threshold=args.center_threshold,
-        event_window=args.event_window,
+        filter_gui=not args.no_gui_filter,
     )
 
     print("\n" + "=" * 60)
