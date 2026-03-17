@@ -91,9 +91,55 @@ def mask_to_bbox(mask: np.ndarray) -> Optional[List[int]]:
     return [int(cmin), int(rmin), int(cmax - cmin + 1), int(rmax - rmin + 1)]
 
 
-def rle_to_bbox(rle_str: str, height: int, width: int) -> Optional[List[int]]:
-    """Convert RLE string directly to bbox [x, y, w, h]."""
+def filter_mask_by_point(
+    mask: np.ndarray,
+    point: Optional[Tuple[int, int]],
+) -> np.ndarray:
+    """Keep only the connected component of mask that contains the point.
+
+    SAM2 masks can cover large areas (entire walls) or have scattered pixels.
+    This filters to only the connected region touching the point prompt,
+    producing tighter bounding boxes for object detection.
+
+    Args:
+        mask: Binary mask (H, W).
+        point: (row, col) point prompt. If None, returns mask unchanged.
+    """
+    if point is None or mask.sum() == 0:
+        return mask
+
+    row, col = point
+    row = max(0, min(row, mask.shape[0] - 1))
+    col = max(0, min(col, mask.shape[1] - 1))
+
+    num_labels, labels = cv2.connectedComponents(mask)
+
+    target_label = labels[row, col]
+    if target_label == 0:
+        # Point not on mask; find nearest component
+        ys, xs = np.where(mask > 0)
+        if len(ys) == 0:
+            return mask
+        dists = (ys - row) ** 2 + (xs - col) ** 2
+        nearest_idx = dists.argmin()
+        target_label = labels[ys[nearest_idx], xs[nearest_idx]]
+
+    return (labels == target_label).astype(np.uint8)
+
+
+def rle_to_bbox(
+    rle_str: str,
+    height: int,
+    width: int,
+    point: Optional[Tuple[int, int]] = None,
+) -> Optional[List[int]]:
+    """Convert RLE string to bbox [x, y, w, h].
+
+    If point is provided, filters mask to the connected component containing
+    that point before computing the bounding box.
+    """
     mask = rle_to_mask(rle_str, height, width)
+    mask = filter_mask_by_point(mask, point)
     return mask_to_bbox(mask)
 
 
@@ -208,6 +254,13 @@ def build_episode_index(data_root: str) -> Dict[str, Dict[int, str]]:
     return index
 
 
+def _raw_video_cache_path(raw_video_dir: str) -> str:
+    """Deterministic cache file path in /tmp based on raw_video_dir."""
+    import hashlib
+    h = hashlib.md5(raw_video_dir.encode()).hexdigest()[:12]
+    return f"/tmp/raw_video_index_{h}.json"
+
+
 def build_raw_video_index(raw_video_dir: str) -> Dict[str, str]:
     """Scan raw_video_dir recursively and build stem → full_path index.
 
@@ -215,14 +268,35 @@ def build_raw_video_index(raw_video_dir: str) -> Dict[str, str]:
         raw_video_dir/all_6xx_Jun_29/data/6.0/Player249-xxx.mp4
         raw_video_dir/all_6xx_Jun_29/data/6.13/Player100-yyy.mp4
 
+    The index is cached to /tmp so subsequent runs skip the scan.
+
     Returns: {"Player249-xxx": "/full/path/Player249-xxx.mp4", ...}
     """
+    cache_file = _raw_video_cache_path(raw_video_dir)
+
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                index = json.load(f)
+            print(f"  Loaded cached index from {cache_file} ({len(index)} entries)")
+            return index
+        except (json.JSONDecodeError, IOError):
+            pass
+
     raw_root = Path(raw_video_dir)
     index: Dict[str, str] = {}
     for mp4 in raw_root.rglob("*.mp4"):
         stem = mp4.stem
         if stem not in index:
             index[stem] = str(mp4)
+
+    try:
+        with open(cache_file, "w") as f:
+            json.dump(index, f)
+        print(f"  Saved index cache to {cache_file}")
+    except IOError:
+        pass
+
     return index
 
 
@@ -429,7 +503,7 @@ def extract_annotations_from_segmentation(
                             continue
 
                         h, w = mask_height, mask_width
-                        bbox = rle_to_bbox(rle_str, h, w)
+                        bbox = rle_to_bbox(rle_str, h, w, point=point)
                         if bbox is None:
                             continue
 

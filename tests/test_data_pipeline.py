@@ -10,6 +10,7 @@ from scripts.build_finetune_dataset import (
     rle_to_mask,
     mask_to_bbox,
     rle_to_bbox,
+    filter_mask_by_point,
     infer_mask_resolution,
     parse_event_label,
     scale_bbox,
@@ -96,6 +97,54 @@ class TestRleToBbox:
         # 8x8 image, fill row 2 cols 2-5 → rle start=18, len=4
         bbox = rle_to_bbox("18 4", 8, 8)
         assert bbox == [2, 2, 4, 1]
+
+    def test_with_point_filters_component(self):
+        # 10x10 image: two blobs
+        # blob A: rows 1-2, cols 1-2 → starts at 11,12,21,22
+        # blob B: rows 7-8, cols 7-8 → starts at 77,78,87,88
+        rle = "11 2 21 2 77 2 87 2"
+        # Without point → bbox covers both blobs
+        bbox_full = rle_to_bbox(rle, 10, 10)
+        assert bbox_full == [1, 1, 8, 8]
+        # With point on blob B → bbox covers only blob B
+        bbox_b = rle_to_bbox(rle, 10, 10, point=(7, 7))
+        assert bbox_b == [7, 7, 2, 2]
+        # With point on blob A → bbox covers only blob A
+        bbox_a = rle_to_bbox(rle, 10, 10, point=(1, 1))
+        assert bbox_a == [1, 1, 2, 2]
+
+
+# ---------------------------------------------------------------------------
+# filter_mask_by_point
+# ---------------------------------------------------------------------------
+
+class TestFilterMaskByPoint:
+    def test_none_point_returns_unchanged(self):
+        mask = np.zeros((10, 10), dtype=np.uint8)
+        mask[2:4, 2:4] = 1
+        result = filter_mask_by_point(mask, None)
+        assert np.array_equal(result, mask)
+
+    def test_keeps_component_at_point(self):
+        mask = np.zeros((10, 10), dtype=np.uint8)
+        mask[1:3, 1:3] = 1  # blob A
+        mask[7:9, 7:9] = 1  # blob B
+        result = filter_mask_by_point(mask, (7, 7))
+        assert result[7, 7] == 1
+        assert result[1, 1] == 0
+        assert result.sum() == 4
+
+    def test_nearest_component_when_point_off_mask(self):
+        mask = np.zeros((10, 10), dtype=np.uint8)
+        mask[5:7, 5:7] = 1
+        result = filter_mask_by_point(mask, (4, 4))
+        assert result[5, 5] == 1
+        assert result.sum() == 4
+
+    def test_empty_mask(self):
+        mask = np.zeros((10, 10), dtype=np.uint8)
+        result = filter_mask_by_point(mask, (5, 5))
+        assert result.sum() == 0
 
 
 # ---------------------------------------------------------------------------
