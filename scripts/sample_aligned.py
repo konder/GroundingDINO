@@ -235,21 +235,33 @@ def sample_aligned(
     return manifest
 
 
+_METADATA_KEYS = [
+    b"__chunk_infos__",
+    b"__chunk_size__",
+    b"__num_episodes__",
+    b"__num_total_frames__",
+]
+
+
 def _copy_keys(
     src_dir: str,
     dst_dir: str,
     keys: List[bytes],
 ) -> int:
-    """Copy specific keys from source LMDB to destination."""
+    """Copy specific keys + MineStudio metadata from source LMDB to destination."""
     src_env = lmdb.open(src_dir, readonly=True, lock=False,
                         readahead=False, map_size=1024**3 * 100)
     os.makedirs(dst_dir, exist_ok=True)
     dst_env = lmdb.open(dst_dir, map_size=1024**3 * 10)
 
     copied = 0
-    key_set = set(keys)
 
     with src_env.begin() as src_txn, dst_env.begin(write=True) as dst_txn:
+        for mk in _METADATA_KEYS:
+            val = src_txn.get(mk)
+            if val is not None:
+                dst_txn.put(mk, val)
+
         for key in keys:
             val = src_txn.get(key)
             if val is not None:
