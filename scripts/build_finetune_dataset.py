@@ -911,17 +911,30 @@ def build_dataset(
         print(f"  Scanning for MP4 files ...")
         raw_video_index = build_raw_video_index(raw_video_dir)
         print(f"  Found {len(raw_video_index)} raw MP4 files")
-        needed_names = set(n for m in seg_episode_index.values() for n in m.values())
+        needed_names = sorted(set(
+            n for m in seg_episode_index.values() for n in m.values()
+        ))
         matched = 0
         total_chunks = 0
-        for n in needed_names:
+        corrupted = 0
+        print(f"  Matching {len(needed_names)} episodes to raw videos ...",
+              flush=True)
+        for i, n in enumerate(needed_names):
+            if (i + 1) % 200 == 0 or i == 0:
+                print(f"    Checking episode {i + 1}/{len(needed_names)} "
+                      f"(matched={matched}) ...", flush=True)
             chunk_info = build_episode_chunk_info(raw_video_index, n)
             if chunk_info and chunk_info.total_frames > 0:
                 matched += 1
                 total_chunks += len(chunk_info.chunks)
+            elif chunk_info and chunk_info.total_frames == 0:
+                corrupted += 1
         build_episode_chunk_info.__defaults__[0].clear()
         print(f"  Episodes with raw video: {matched}/{len(needed_names)} "
-              f"({total_chunks} total chunks)")
+              f"({total_chunks} total chunks)", flush=True)
+        if corrupted:
+            print(f"  Corrupted video files (moov atom missing): {corrupted}",
+                  flush=True)
 
     print(f"[2/5] Extracting annotations from segmentation "
           f"(mask_area={min_mask_area}-{max_mask_area:.0%}"
@@ -1149,4 +1162,7 @@ def main():
 
 
 if __name__ == "__main__":
+    import os as _os
+    _os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
+    _os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
     main()
