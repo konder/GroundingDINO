@@ -745,11 +745,18 @@ def extract_annotations_from_segmentation(
         env = lmdb.open(seg_path, readonly=True, lock=False,
                         readahead=False, map_size=1024**3 * 100)
         with env.begin() as txn:
+            n_keys_in_part = txn.stat()["entries"]
+            chunk_count = 0
             for key_raw, val_raw in txn.cursor():
                 key_str = key_raw.decode()
 
                 if key_str.startswith("__"):
                     continue
+
+                chunk_count += 1
+                if chunk_count % 2000 == 0:
+                    print(f"      chunk {chunk_count}/{n_keys_in_part} "
+                          f"({len(annotations)} annotations) ...", flush=True)
 
                 chunk_key = eval(key_str)  # (episode_id, frame_offset)
                 episode_id = chunk_key[0]
