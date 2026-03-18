@@ -231,24 +231,34 @@ def build_coco_output(annotations: List[Dict]) -> Dict:
 
 def decode_image_chunk(env: lmdb.Environment, ep_idx: int,
                        chunk_offset: int) -> Optional[List[np.ndarray]]:
-    """Decode 32 frames from an image LMDB MP4 chunk."""
+    """Decode 32 frames from an image LMDB MP4 chunk.
+
+    Uses a shared tempfile to avoid per-call tempfile creation overhead.
+    """
     key = f"({ep_idx}, {chunk_offset})"
     with env.begin() as txn:
         raw = txn.get(key.encode())
         if raw is None:
             return None
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp.write(raw)
-    tmp.close()
+
+    # Reuse a single tempfile path per thread to reduce filesystem overhead
+    tmp_path = getattr(decode_image_chunk, "_tmp_path", None)
+    if tmp_path is None:
+        fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+        decode_image_chunk._tmp_path = tmp_path
+
+    with open(tmp_path, "wb") as f:
+        f.write(raw)
+
     frames = []
-    cap = cv2.VideoCapture(tmp.name)
+    cap = cv2.VideoCapture(tmp_path)
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         frames.append(frame)
     cap.release()
-    os.unlink(tmp.name)
     return frames if frames else None
 
 
@@ -294,11 +304,20 @@ def _build_episode_maps(data_roots: List[str]):
     seg_ep_map = {}
     img_ep_map = {}
 
-    for root in data_roots:
+    for ri, root in enumerate(data_roots):
+        root_name = Path(root).name
         seg_dir = os.path.join(root, "segmentation")
         img_dir = os.path.join(root, "image")
 
-        for part_path in _find_lmdb_parts(seg_dir):
+        seg_parts = _find_lmdb_parts(seg_dir)
+        img_parts = _find_lmdb_parts(img_dir)
+        _print(f"  [{ri+1}/{len(data_roots)}] {root_name}: "
+               f"{len(seg_parts)} seg parts, {len(img_parts)} img parts")
+
+        for pi, part_path in enumerate(seg_parts):
+            if (pi + 1) % 10 == 0 or pi == 0 or pi == len(seg_parts) - 1:
+                _print(f"    seg partition {pi+1}/{len(seg_parts)} "
+                       f"({len(seg_ep_map)} episodes)")
             env = lmdb.open(part_path, readonly=True, lock=False,
                             readahead=False, map_size=1024**3 * 100)
             with env.begin() as txn:
@@ -308,7 +327,10 @@ def _build_episode_maps(data_roots: List[str]):
                         seg_ep_map[(part_path, info["episode_idx"])] = info["episode"]
             env.close()
 
-        for part_path in _find_lmdb_parts(img_dir):
+        for pi, part_path in enumerate(img_parts):
+            if (pi + 1) % 10 == 0 or pi == 0 or pi == len(img_parts) - 1:
+                _print(f"    img partition {pi+1}/{len(img_parts)} "
+                       f"({len(img_ep_map)} episodes)")
             env = lmdb.open(part_path, readonly=True, lock=False,
                             readahead=False, map_size=1024**3 * 100)
             with env.begin() as txn:
@@ -351,62 +373,113 @@ def _scan_events(
     """
     events: List[EventRecord] = []
     seen = set()
-    total_pixels = 360 * 640
 
+    # Pre-build set of ep_idx values that have image data per partition
+    matched_eps: Dict[str, Set[int]] = defaultdict(set)
+    for (part_path, ep_idx), ep_name in seg_ep_map.items():
+        if ep_name in img_ep_map:
+            matched_eps[part_path].add(ep_idx)
+
+    all_seg_parts = []
     for root in data_roots:
         seg_dir = os.path.join(root, "segmentation")
-        for part_path in _find_lmdb_parts(seg_dir):
-            env = lmdb.open(part_path, readonly=True, lock=False,
-                            readahead=False, map_size=1024**3 * 100)
-            with env.begin() as txn:
-                for key_raw, val_raw in txn.cursor():
-                    ks = key_raw.decode()
-                    if ks.startswith("__"):
-                        continue
-                    chunk_key = eval(ks)
-                    ep_idx, frame_offset = chunk_key
-                    ep_name = seg_ep_map.get((part_path, ep_idx))
-                    if not ep_name or ep_name not in img_ep_map:
-                        continue
+        all_seg_parts.extend(_find_lmdb_parts(seg_dir))
 
-                    frames = pickle.loads(val_raw)
-                    for fi, fd in enumerate(frames):
-                        gf = frame_offset + fi
-                        for ek, ev in fd.items():
-                            if not isinstance(ev, dict):
-                                continue
-                            event_name = ev.get("event", "")
-                            label = parse_event_label(event_name)
-                            if label is None:
-                                continue
-                            fr = ev.get("frame_range")
-                            if not fr:
-                                continue
-                            if gf != fr[1]:
-                                continue
+    t_scan = time.time()
+    for part_i, part_path in enumerate(all_seg_parts):
+        part_matched = matched_eps.get(part_path, set())
+        if not part_matched:
+            _print(f"    [{part_i+1}/{len(all_seg_parts)}] "
+                   f"{Path(part_path).name}: 0 matched episodes, skipping")
+            continue
 
-                            dedup_key = (ep_name, event_name, fr[0], fr[1])
-                            if dedup_key in seen:
-                                continue
-                            seen.add(dedup_key)
+        env = lmdb.open(part_path, readonly=True, lock=False,
+                        readahead=False, map_size=1024**3 * 100)
+        with env.begin() as txn:
+            n_entries = txn.stat()["entries"]
+            chunk_count = 0
+            skipped_ep = 0
+            for key_raw, val_raw in txn.cursor():
+                ks = key_raw.decode()
+                if ks.startswith("__"):
+                    continue
 
-                            img_part, img_eidx = img_ep_map[ep_name]
-                            events.append(EventRecord(
-                                event_name=event_name,
-                                label=label,
-                                ep_name=ep_name,
-                                seg_part=part_path,
-                                seg_ep_idx=ep_idx,
-                                img_part=img_part,
-                                img_ep_idx=img_eidx,
-                                frame_start=fr[0],
-                                frame_end=fr[1],
-                            ))
-            env.close()
-            _print(f"    Scanned {Path(part_path).name}: "
-                   f"{len(events)} events so far")
+                chunk_count += 1
+                if chunk_count % 5000 == 0:
+                    elapsed = time.time() - t_scan
+                    _print(f"      chunk {chunk_count}/{n_entries} "
+                           f"({len(events)} events, {elapsed:.0f}s)")
+
+                chunk_key = eval(ks)
+                ep_idx, frame_offset = chunk_key
+
+                if ep_idx not in part_matched:
+                    skipped_ep += 1
+                    continue
+
+                ep_name = seg_ep_map[(part_path, ep_idx)]
+                frames = pickle.loads(val_raw)
+                for fi, fd in enumerate(frames):
+                    gf = frame_offset + fi
+                    for ek, ev in fd.items():
+                        if not isinstance(ev, dict):
+                            continue
+                        event_name = ev.get("event", "")
+                        label = parse_event_label(event_name)
+                        if label is None:
+                            continue
+                        fr = ev.get("frame_range")
+                        if not fr:
+                            continue
+                        if gf != fr[1]:
+                            continue
+
+                        dedup_key = (ep_name, event_name, fr[0], fr[1])
+                        if dedup_key in seen:
+                            continue
+                        seen.add(dedup_key)
+
+                        img_part, img_eidx = img_ep_map[ep_name]
+                        events.append(EventRecord(
+                            event_name=event_name,
+                            label=label,
+                            ep_name=ep_name,
+                            seg_part=part_path,
+                            seg_ep_idx=ep_idx,
+                            img_part=img_part,
+                            img_ep_idx=img_eidx,
+                            frame_start=fr[0],
+                            frame_end=fr[1],
+                        ))
+        env.close()
+        _print(f"    [{part_i+1}/{len(all_seg_parts)}] "
+               f"{Path(part_path).name}: {chunk_count} chunks "
+               f"(skipped {skipped_ep} unmatched), "
+               f"{len(events)} events total")
 
     return events
+
+
+_env_cache: Dict[str, lmdb.Environment] = {}
+
+
+def _get_env(path: str) -> lmdb.Environment:
+    """Get or create a cached LMDB environment (avoids repeated open/close)."""
+    if path not in _env_cache:
+        _env_cache[path] = lmdb.open(
+            path, readonly=True, lock=False,
+            readahead=False, map_size=1024**3 * 100)
+    return _env_cache[path]
+
+
+def _close_all_envs():
+    """Close all cached LMDB environments."""
+    for env in _env_cache.values():
+        try:
+            env.close()
+        except Exception:
+            pass
+    _env_cache.clear()
 
 
 def _collect_masks_for_frames(
@@ -424,13 +497,13 @@ def _collect_masks_for_frames(
     Returns: {global_frame: (bbox_xywh, point)} for frames with valid masks.
     """
     max_pixels = int(mask_h * mask_w * max_mask_area_frac)
+    frame_set = set(frame_indices)
     chunks_needed = set()
     for gf in frame_indices:
         chunks_needed.add((gf // 32) * 32)
 
     results = {}
-    env = lmdb.open(seg_part, readonly=True, lock=False,
-                    readahead=False, map_size=1024**3 * 100)
+    env = _get_env(seg_part)
     with env.begin() as txn:
         for chunk_off in sorted(chunks_needed):
             key = f"({seg_ep_idx}, {chunk_off})"
@@ -440,7 +513,7 @@ def _collect_masks_for_frames(
             frames = pickle.loads(raw)
             for fi, fd in enumerate(frames):
                 gf = chunk_off + fi
-                if gf not in frame_indices:
+                if gf not in frame_set:
                     continue
                 for ek, ev in fd.items():
                     if not isinstance(ev, dict):
@@ -460,7 +533,6 @@ def _collect_masks_for_frames(
                     bbox = mask_to_bbox(mask)
                     if bbox:
                         results[gf] = (bbox, pt_tuple)
-    env.close()
     return results
 
 
@@ -470,21 +542,20 @@ def _decode_frames_from_image_lmdb(
     frame_indices: List[int],
 ) -> Dict[int, np.ndarray]:
     """Decode specific frames from image LMDB."""
+    frame_set = set(frame_indices)
     chunks_needed = set()
     for gf in frame_indices:
         chunks_needed.add((gf // 32) * 32)
 
     decoded = {}
-    env = lmdb.open(img_part, readonly=True, lock=False,
-                    readahead=False, map_size=1024**3 * 100)
+    env = _get_env(img_part)
     for chunk_off in sorted(chunks_needed):
         chunk_frames = decode_image_chunk(env, img_ep_idx, chunk_off)
         if chunk_frames:
             for i, frame in enumerate(chunk_frames):
                 gf = chunk_off + i
-                if gf in frame_indices:
+                if gf in frame_set:
                     decoded[gf] = frame
-    env.close()
     return decoded
 
 
@@ -570,6 +641,14 @@ def build_dataset(
     _print(f"[3/5] Extracting frames and masks (n_frames={n_frames}, "
            f"skip_tail={skip_tail})...")
 
+    # Group events by (seg_part, img_part) for locality
+    from itertools import groupby
+    events_sorted = sorted(events, key=lambda e: (e.seg_part, e.img_part))
+    groups = []
+    for key, grp in groupby(events_sorted, key=lambda e: (e.seg_part, e.img_part)):
+        groups.append((key, list(grp)))
+    _print(f"  {len(events)} events in {len(groups)} partition groups")
+
     all_annotations = []
     stats = {
         "events_processed": 0,
@@ -581,76 +660,87 @@ def build_dataset(
     }
 
     t_start = time.time()
-    for ev_i, ev in enumerate(events):
-        if (ev_i + 1) % 500 == 0 or ev_i == 0:
-            elapsed = time.time() - t_start
-            rate = (ev_i + 1) / elapsed if elapsed > 0 else 0
-            eta = (len(events) - ev_i - 1) / rate if rate > 0 else 0
-            _print(f"    Event {ev_i + 1}/{len(events)} "
-                   f"({stats['frames_exported']} frames, "
-                   f"{rate:.1f} ev/s, ETA {eta:.0f}s)")
+    ev_global = 0
+    progress_interval = max(1, min(200, len(events) // 20))
 
-        candidate_frames = select_training_frames(
-            ev.frame_start, ev.frame_end, n_frames, skip_tail)
-        if not candidate_frames:
-            stats["events_no_valid_frames"] += 1
-            continue
+    for grp_i, ((seg_part, img_part), grp_events) in enumerate(groups):
+        _print(f"  Group {grp_i+1}/{len(groups)}: "
+               f"{Path(seg_part).name} ↔ {Path(img_part).name} "
+               f"({len(grp_events)} events)")
 
-        frame_set = set(candidate_frames)
+        for ev in grp_events:
+            ev_global += 1
+            if ev_global % progress_interval == 0:
+                elapsed = time.time() - t_start
+                rate = ev_global / elapsed if elapsed > 0 else 0
+                eta = (len(events) - ev_global) / rate if rate > 0 else 0
+                _print(f"    Event {ev_global}/{len(events)} "
+                       f"({stats['frames_exported']} frames, "
+                       f"{rate:.1f} ev/s, ETA {eta:.0f}s)")
 
-        masks = _collect_masks_for_frames(
-            ev.seg_part, ev.seg_ep_idx, ev.event_name,
-            candidate_frames,
-            mask_h=mask_hw[0], mask_w=mask_hw[1],
-            min_mask_area=min_mask_area,
-            max_mask_area_frac=max_mask_area_frac,
-        )
-
-        valid_frames = [f for f in candidate_frames if f in masks]
-        if not valid_frames:
-            stats["frames_no_mask"] += len(candidate_frames)
-            stats["events_no_valid_frames"] += 1
-            continue
-
-        decoded = _decode_frames_from_image_lmdb(
-            ev.img_part, ev.img_ep_idx, valid_frames)
-
-        has_any = False
-        for gf in valid_frames:
-            if gf not in decoded:
-                stats["frames_no_image"] += 1
+            candidate_frames = select_training_frames(
+                ev.frame_start, ev.frame_end, n_frames, skip_tail)
+            if not candidate_frames:
+                stats["events_no_valid_frames"] += 1
                 continue
 
-            frame = decoded[gf]
-            if filter_gui and detect_gui_frame(frame):
-                stats["frames_gui_filtered"] += 1
+            masks = _collect_masks_for_frames(
+                ev.seg_part, ev.seg_ep_idx, ev.event_name,
+                candidate_frames,
+                mask_h=mask_hw[0], mask_w=mask_hw[1],
+                min_mask_area=min_mask_area,
+                max_mask_area_frac=max_mask_area_frac,
+            )
+
+            valid_frames = [f for f in candidate_frames if f in masks]
+            if not valid_frames:
+                stats["frames_no_mask"] += len(candidate_frames)
+                stats["events_no_valid_frames"] += 1
                 continue
 
-            h_img, w_img = frame.shape[:2]
-            bbox_mask = masks[gf][0]
-            bbox_scaled = scale_bbox_to_image(bbox_mask, mask_hw, (h_img, w_img))
+            decoded = _decode_frames_from_image_lmdb(
+                ev.img_part, ev.img_ep_idx, valid_frames)
 
-            seg_part_name = Path(ev.seg_part).name
-            img_filename = f"{seg_part_name}_ep{ev.seg_ep_idx}_f{gf:06d}.png"
-            img_path = os.path.join(img_dir, img_filename)
+            has_any = False
+            for gf in valid_frames:
+                if gf not in decoded:
+                    stats["frames_no_image"] += 1
+                    continue
 
-            if not os.path.exists(img_path):
-                cv2.imwrite(img_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                frame = decoded[gf]
+                if filter_gui and detect_gui_frame(frame):
+                    stats["frames_gui_filtered"] += 1
+                    continue
 
-            all_annotations.append({
-                "image_file": img_filename,
-                "category": ev.label,
-                "bbox": bbox_scaled,
-                "image_width": w_img,
-                "image_height": h_img,
-            })
-            stats["frames_exported"] += 1
-            has_any = True
+                h_img, w_img = frame.shape[:2]
+                bbox_mask = masks[gf][0]
+                bbox_scaled = scale_bbox_to_image(bbox_mask, mask_hw, (h_img, w_img))
 
-        if not has_any:
-            stats["events_no_valid_frames"] += 1
-        stats["events_processed"] += 1
+                seg_part_name = Path(ev.seg_part).name
+                img_filename = f"{seg_part_name}_ep{ev.seg_ep_idx}_f{gf:06d}.png"
+                img_path = os.path.join(img_dir, img_filename)
 
+                if not os.path.exists(img_path):
+                    cv2.imwrite(img_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+
+                all_annotations.append({
+                    "image_file": img_filename,
+                    "category": ev.label,
+                    "bbox": bbox_scaled,
+                    "image_width": w_img,
+                    "image_height": h_img,
+                })
+                stats["frames_exported"] += 1
+                has_any = True
+
+            if not has_any:
+                stats["events_no_valid_frames"] += 1
+            stats["events_processed"] += 1
+
+    _close_all_envs()
+
+    elapsed_total = time.time() - t_start
+    _print(f"  Done in {elapsed_total:.1f}s")
     _print(f"  Processed {stats['events_processed']} events")
     _print(f"  Exported {stats['frames_exported']} frames")
     _print(f"  No valid frames: {stats['events_no_valid_frames']} events")
@@ -658,7 +748,13 @@ def build_dataset(
     _print(f"  No mask: {stats['frames_no_mask']} frames")
     _print(f"  No image data: {stats['frames_no_image']} frames")
 
-    # --- Step 5: COCO output ---
+    # Cleanup tempfile used by decode_image_chunk
+    tmp_path = getattr(decode_image_chunk, "_tmp_path", None)
+    if tmp_path and os.path.exists(tmp_path):
+        os.unlink(tmp_path)
+        decode_image_chunk._tmp_path = None
+
+    # --- Step 4: COCO output ---
     _print(f"[4/5] Building COCO annotations...")
     coco = build_coco_output(all_annotations)
     coco_path = os.path.join(output_dir, "annotations.json")
