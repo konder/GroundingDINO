@@ -12,6 +12,7 @@ from scripts.build_action_dataset import (
     find_attack_start_for_event,
     select_preattack_frames,
     select_early_range_frames,
+    select_backtrack_frames,
     EventInfo,
     extract_events_from_segmentation,
 )
@@ -252,6 +253,40 @@ class TestSelectEarlyRangeFrames:
         assert frames == [100]
 
 
+class TestSelectBacktrackFrames:
+    def test_normal_case(self):
+        """Event at 613, skip_tail=8, n_frames=4 → frames 601..604."""
+        frames = select_backtrack_frames((534, 613), n_frames=4, skip_tail=8)
+        assert frames == [601, 602, 603, 604]
+
+    def test_large_backtrack(self):
+        """With more frames, go further back."""
+        frames = select_backtrack_frames((534, 613), n_frames=8, skip_tail=8)
+        assert frames == list(range(597, 605))
+
+    def test_clamp_to_tracking_start(self):
+        """If backtrack would go before tracking_start, clamp."""
+        frames = select_backtrack_frames((600, 613), n_frames=10, skip_tail=8)
+        assert frames == [600, 601, 602, 603, 604]
+        assert frames[0] == 600  # clamped to tracking_start
+
+    def test_short_range_returns_less(self):
+        """Very short tracking range returns fewer frames."""
+        frames = select_backtrack_frames((608, 613), n_frames=4, skip_tail=8)
+        assert frames == []  # 613-8=605, but start clamps to 608, 608>=605 → empty
+
+    def test_skip_tail_zero(self):
+        """With skip_tail=0, select frames right before the event."""
+        frames = select_backtrack_frames((534, 613), n_frames=4, skip_tail=0)
+        assert frames == [609, 610, 611, 612]
+
+    def test_real_data_example(self):
+        """Based on actual data: ori_frame_range=(534, 613) for mine_block:stone."""
+        frames = select_backtrack_frames((534, 613), n_frames=4, skip_tail=12)
+        assert frames == [597, 598, 599, 600]
+        assert all(534 <= f < 613 for f in frames)
+
+
 # ---------------------------------------------------------------------------
 # EventInfo / extract_events_from_segmentation
 # ---------------------------------------------------------------------------
@@ -286,3 +321,59 @@ class TestExtractEvents:
         assert ev.episode_name == "Player1-abc-20210101-120000"
         assert ev.event_frame == 330
         assert ev.frame_range == (300, 330)
+
+    def test_extracts_ori_frame_range(self, tmp_path):
+        """Ensure ori_frame_range is captured from event metadata."""
+        import lmdb as _lmdb
+        seg_dir = tmp_path / "segmentation" / "part-200"
+        seg_dir.mkdir(parents=True)
+        env = _lmdb.open(str(seg_dir), map_size=10 * 1024 * 1024)
+        infos = [{"episode": "Player2-xyz", "episode_idx": 0, "num_frames": 3000}]
+        frame_data = [{}] * 32
+        frame_data[5] = {
+            (613, "minecraft.mine_block:minecraft.stone"): {
+                "event": "mine_block:stone",
+                "rle_mask": "100 50",
+                "point": (180, 320),
+                "frame_id": 241,
+                "frame_range": (241, 306),
+                "ori_frame_id": 546,
+                "ori_frame_range": (534, 613),
+            }
+        }
+        with env.begin(write=True) as txn:
+            txn.put("__chunk_infos__".encode(), pickle.dumps(infos))
+            txn.put("(0, 224)".encode(), pickle.dumps(frame_data))
+        env.close()
+
+        events = extract_events_from_segmentation(str(tmp_path))
+        assert len(events) == 1
+        ev = events[0]
+        assert ev.ori_frame_range == (534, 613)
+        assert ev.frame_range == (241, 306)
+
+    def test_missing_ori_frame_range(self, tmp_path):
+        """Events without ori_frame_range should have None."""
+        import lmdb as _lmdb
+        seg_dir = tmp_path / "segmentation" / "part-300"
+        seg_dir.mkdir(parents=True)
+        env = _lmdb.open(str(seg_dir), map_size=10 * 1024 * 1024)
+        infos = [{"episode": "Player3", "episode_idx": 0, "num_frames": 1000}]
+        frame_data = [{}] * 32
+        frame_data[0] = {
+            (100, "mine_block:dirt"): {
+                "event": "mine_block:dirt",
+                "rle_mask": "50 30",
+                "point": (180, 320),
+                "frame_id": 0,
+                "frame_range": (0, 20),
+            }
+        }
+        with env.begin(write=True) as txn:
+            txn.put("__chunk_infos__".encode(), pickle.dumps(infos))
+            txn.put("(0, 0)".encode(), pickle.dumps(frame_data))
+        env.close()
+
+        events = extract_events_from_segmentation(str(tmp_path))
+        assert len(events) == 1
+        assert events[0].ori_frame_range is None

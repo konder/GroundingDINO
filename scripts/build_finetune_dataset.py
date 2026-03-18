@@ -940,6 +940,83 @@ def visualize_annotation(
 
 
 # ---------------------------------------------------------------------------
+# Annotation cache (skip expensive LMDB scan on reruns)
+# ---------------------------------------------------------------------------
+
+def _annotation_cache_path(data_root: str, min_mask_area: int,
+                            max_mask_area: float, center_threshold: float) -> str:
+    import hashlib
+    key = f"{os.path.abspath(data_root)}|{min_mask_area}|{max_mask_area}|{center_threshold}"
+    h = hashlib.md5(key.encode()).hexdigest()[:12]
+    return f"/tmp/ann_cache_{h}.json"
+
+
+def _save_annotation_cache(
+    data_root: str, min_mask_area: int, max_mask_area: float,
+    center_threshold: float,
+    annotations: List[DetectionAnnotation],
+    cat_stats: Dict[str, set],
+) -> None:
+    path = _annotation_cache_path(data_root, min_mask_area, max_mask_area,
+                                   center_threshold)
+    data = {
+        "annotations": [asdict(a) for a in annotations],
+        "cat_stats": {k: list(v) for k, v in cat_stats.items()},
+    }
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+        print(f"  Saved annotation cache to {path}", flush=True)
+    except IOError:
+        pass
+
+
+def _load_annotation_cache(
+    data_root: str, min_mask_area: int, max_mask_area: float,
+    center_threshold: float,
+) -> Optional[Tuple[List[DetectionAnnotation], Dict[str, set]]]:
+    path = _annotation_cache_path(data_root, min_mask_area, max_mask_area,
+                                   center_threshold)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        annotations = [DetectionAnnotation(**a) for a in data["annotations"]]
+        cat_stats = {k: set(v) for k, v in data["cat_stats"].items()}
+        return annotations, cat_stats
+    except (json.JSONDecodeError, IOError, TypeError, KeyError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Multiprocess frame export helper
+# ---------------------------------------------------------------------------
+
+def _export_chunk_group(args: Tuple[str, List[Tuple[int, str]]]) -> Tuple[int, int]:
+    """Worker function: open one MP4, extract all needed frames, save as PNG.
+
+    Returns (exported_count, skipped_count).
+    """
+    chunk_path, frames_list = args
+    exported = 0
+    skipped = 0
+    cap = cv2.VideoCapture(chunk_path)
+    if not cap.isOpened():
+        return 0, len(frames_list)
+    for local_frame, img_path in frames_list:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, local_frame)
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            cv2.imwrite(img_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            exported += 1
+        else:
+            skipped += 1
+    cap.release()
+    return exported, skipped
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1012,15 +1089,28 @@ def build_dataset(
 
     print(f"[2/5] Extracting annotations from segmentation "
           f"(mask_area={min_mask_area}-{max_mask_area:.0%}"
-          f"{f', center={center_threshold:.0%}' if center_threshold > 0 else ''}) ...")
-    annotations, cat_stats = extract_annotations_from_segmentation(
-        data_root, image_index, mask_height, mask_width,
-        min_mask_area=min_mask_area,
-        max_mask_area=max_mask_area,
-        center_threshold=center_threshold,
-    )
-    print(f"  Extracted {len(annotations)} annotations")
-    print(f"  Categories: {', '.join(f'{k}({len(v)})' for k, v in sorted(cat_stats.items()))}")
+          f"{f', center={center_threshold:.0%}' if center_threshold > 0 else ''}) ...",
+          flush=True)
+
+    ann_cache = _load_annotation_cache(
+        data_root, min_mask_area, max_mask_area, center_threshold)
+    if ann_cache is not None:
+        annotations, cat_stats = ann_cache
+        print(f"  Loaded from cache ({len(annotations)} annotations)", flush=True)
+    else:
+        annotations, cat_stats = extract_annotations_from_segmentation(
+            data_root, image_index, mask_height, mask_width,
+            min_mask_area=min_mask_area,
+            max_mask_area=max_mask_area,
+            center_threshold=center_threshold,
+        )
+        _save_annotation_cache(
+            data_root, min_mask_area, max_mask_area, center_threshold,
+            annotations, cat_stats)
+
+    print(f"  Extracted {len(annotations)} annotations", flush=True)
+    print(f"  Categories: {', '.join(f'{k}({len(v)})' for k, v in sorted(cat_stats.items()))}",
+          flush=True)
 
     if not annotations:
         print("  WARNING: No annotations found. Check data alignment.")
@@ -1089,34 +1179,36 @@ def build_dataset(
               f"{total_frames_to_read} frames to read "
               f"(skipped {exported} existing, {skipped} missing)", flush=True)
 
-        frames_done = 0
-        for chunk_i, (chunk_path, frames_list) in enumerate(chunk_groups.items()):
-            if (chunk_i + 1) % 100 == 0 or chunk_i == 0:
-                elapsed = time.time() - t_export_start
-                rate = frames_done / elapsed if elapsed > 0 else 0
-                eta = (total_frames_to_read - frames_done) / rate if rate > 0 else 0
-                print(f"    Chunk {chunk_i + 1}/{total_chunks} "
-                      f"({frames_done}/{total_frames_to_read} frames, "
-                      f"{rate:.1f} f/s, ETA {eta:.0f}s)", flush=True)
+        n_workers = min(os.cpu_count() or 4, total_chunks, 8)
+        work_items = list(chunk_groups.items())
 
-            cap = cv2.VideoCapture(chunk_path)
-            if not cap.isOpened():
-                skipped += len(frames_list)
-                frames_done += len(frames_list)
-                continue
-
-            for local_frame, img_path in frames_list:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, local_frame)
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    cv2.imwrite(img_path, frame,
-                                [cv2.IMWRITE_PNG_COMPRESSION, 1])
-                    exported += 1
-                else:
-                    skipped += 1
-                frames_done += 1
-
-            cap.release()
+        if n_workers > 1:
+            from multiprocessing import Pool
+            print(f"  Using {n_workers} workers for frame export", flush=True)
+            done_count = 0
+            with Pool(n_workers) as pool:
+                for exp, skp in pool.imap_unordered(
+                        _export_chunk_group, work_items, chunksize=4):
+                    exported += exp
+                    skipped += skp
+                    done_count += 1
+                    if done_count % 200 == 0 or done_count == total_chunks:
+                        elapsed = time.time() - t_export_start
+                        rate = (exported + skipped) / elapsed if elapsed > 0 else 0
+                        print(f"    {done_count}/{total_chunks} chunks done "
+                              f"({exported} exported, {rate:.1f} f/s)",
+                              flush=True)
+        else:
+            for chunk_i, work in enumerate(work_items):
+                exp, skp = _export_chunk_group(work)
+                exported += exp
+                skipped += skp
+                if (chunk_i + 1) % 100 == 0 or chunk_i == 0:
+                    elapsed = time.time() - t_export_start
+                    rate = exported / elapsed if elapsed > 0 else 0
+                    print(f"    Chunk {chunk_i + 1}/{total_chunks} "
+                          f"({exported} exported, {rate:.1f} f/s)",
+                          flush=True)
     else:
         for task_i, ann in enumerate(frame_tasks):
             if (task_i + 1) % 500 == 0:

@@ -1,19 +1,20 @@
-"""Build fine-tuning dataset using action-based frame selection.
+"""Build fine-tuning dataset using frame backtracking from block-break events.
 
-Instead of using MineStudio's pre-computed SAM2 masks (which suffer from
-GUI contamination and tracking drift), this script:
+Core hypothesis:
+  mine_block events fire when a block is destroyed.  At that moment the
+  player's crosshair (screen center) points at the block's position.
+  Going back N frames (≈ mining animation duration) the block is still
+  intact and visible at screen center — exactly the image we need for
+  object detection training.
 
-1. Reads events from segmentation LMDB (event type + frame_range)
-2. Reads per-frame action data to find where attack=1 starts
-3. Selects N frames BEFORE the attack started (player looking at target,
-   no mining cracks, no GUI)
-4. Decodes those frames from raw video
-5. Runs SAM2 with screen center point to generate fresh masks
-
-This produces higher-quality annotations because:
-- No GUI (must be closed before attack)
-- Crosshair aligned with target (player aiming at block to mine)
-- Block intact (no break animation)
+Supported frame-selection modes:
+  backtrack   (NEW, recommended)
+      Go back from the event frame using *original* video coordinates
+      (ori_frame_range).  No action LMDB required.
+  early_range
+      First N frames of the SAM2 tracking window (frame_range).
+  preattack
+      N frames before the continuous attack=1 sequence (needs action LMDB).
 """
 from __future__ import annotations
 
@@ -60,6 +61,7 @@ class EventInfo:
     seg_partition: str
     event_frame: int
     frame_range: Tuple[int, int]
+    ori_frame_range: Optional[Tuple[int, int]] = None
 
 
 @dataclass
@@ -297,6 +299,36 @@ def select_early_range_frames(
     return list(range(fr_start, end))
 
 
+def select_backtrack_frames(
+    ori_frame_range: Tuple[int, int],
+    n_frames: int = 4,
+    skip_tail: int = 8,
+) -> List[int]:
+    """Select frames by backtracking from the block-break event.
+
+    ori_frame_range uses original video coordinates:
+      [0] = earliest frame where SAM2 saw the block
+      [1] = the frame when the block broke (mine_block event)
+
+    Strategy: go back from the event frame, skipping the tail frames
+    (which show mining cracks / break animation) and selecting N frames
+    where the block should be intact.
+
+    With default skip_tail=8 (~0.4s at 20fps) and n_frames=4:
+      event at frame 613 → select frames 601..604
+      (skip 609-612 = break/crack frames)
+    """
+    event_frame = ori_frame_range[1]
+    tracking_start = ori_frame_range[0]
+
+    end = max(event_frame - skip_tail, tracking_start)
+    start = max(end - n_frames, tracking_start)
+
+    if start >= end:
+        return []
+    return list(range(start, end))
+
+
 # ---------------------------------------------------------------------------
 # Event extraction from segmentation
 # ---------------------------------------------------------------------------
@@ -360,6 +392,7 @@ def extract_events_from_segmentation(
                             if frame_range is None:
                                 continue
 
+                            ori_frame_range = event_val.get("ori_frame_range")
                             event_frame = frame_range[1]
                             dedup_key = (episode_name, event_name, event_frame)
 
@@ -372,6 +405,7 @@ def extract_events_from_segmentation(
                                     seg_partition=part_path,
                                     event_frame=event_frame,
                                     frame_range=frame_range,
+                                    ori_frame_range=tuple(ori_frame_range) if ori_frame_range else None,
                                 )
         finally:
             env.close()
@@ -390,10 +424,11 @@ def build_action_dataset(
     output_dir: str,
     raw_video_dir: str,
     action_root: Optional[str] = None,
-    n_frames: int = 8,
-    frame_mode: str = "early_range",
+    n_frames: int = 4,
+    frame_mode: str = "backtrack",
     max_visualize: int = 0,
     sam2_model: Optional[str] = None,
+    **kwargs,
 ) -> dict:
     """Build fine-tuning dataset using action-based frame selection.
 
@@ -424,12 +459,16 @@ def build_action_dataset(
         print("  No events found!")
         return {"total_events": 0}
 
-    # Step 2: Build action index
-    print("[2/6] Building action index ...")
-    action_index = build_action_index(action_root)
-    print(f"  Action episodes: {len(action_index)}")
-    matched = sum(1 for ev in events if ev.episode_name in action_index)
-    print(f"  Events with action data: {matched}/{len(events)}")
+    # Step 2: Build action index (only needed for preattack mode)
+    action_index: Dict[str, Tuple[str, int]] = {}
+    if frame_mode == "preattack":
+        print("[2/6] Building action index ...")
+        action_index = build_action_index(action_root)
+        print(f"  Action episodes: {len(action_index)}")
+        matched = sum(1 for ev in events if ev.episode_name in action_index)
+        print(f"  Events with action data: {matched}/{len(events)}")
+    else:
+        print("[2/6] Action index not needed for mode={frame_mode}, skipping")
 
     # Step 3: Build raw video index
     print("[3/6] Building raw video index ...")
@@ -442,6 +481,7 @@ def build_action_dataset(
     stats = {
         "no_action_data": 0,
         "no_attack_found": 0,
+        "no_ori_range": 0,
         "no_frames": 0,
         "selected": 0,
         "decode_ok": 0,
@@ -453,8 +493,16 @@ def build_action_dataset(
     }
     ann_id = 0
 
+    skip_tail = kwargs.get("skip_tail", 8)
+
     for ev in events:
-        if frame_mode == "early_range":
+        if frame_mode == "backtrack":
+            if ev.ori_frame_range is None:
+                stats["no_ori_range"] += 1
+                continue
+            selected = select_backtrack_frames(
+                ev.ori_frame_range, n_frames, skip_tail)
+        elif frame_mode == "early_range":
             selected = select_early_range_frames(ev.frame_range, n_frames)
         elif frame_mode == "preattack":
             act_entry = action_index.get(ev.episode_name)
@@ -538,8 +586,12 @@ def build_action_dataset(
             annotated_frames.append(af)
             ann_id += 1
 
-    print(f"  Events without action data: {stats['no_action_data']}")
-    print(f"  Events without attack found: {stats['no_attack_found']}")
+    if stats["no_ori_range"]:
+        print(f"  Events without ori_frame_range: {stats['no_ori_range']}")
+    if stats["no_action_data"]:
+        print(f"  Events without action data: {stats['no_action_data']}")
+    if stats["no_attack_found"]:
+        print(f"  Events without attack found: {stats['no_attack_found']}")
     print(f"  Events with no frames: {stats['no_frames']}")
     print(f"  Selected frames: {stats['selected']}")
     print(f"  Decoded OK: {stats['decode_ok']}")
@@ -555,11 +607,12 @@ def build_action_dataset(
     if frame_mode == "early_range":
         print("[5/6] Masks loaded from segmentation LMDB (no SAM2 needed)")
     elif sam2_model:
-        print(f"[5/6] Running SAM2 ...")
+        print("[5/6] Running SAM2 ...")
         _run_sam2_inference(output_dir, annotated_frames, sam2_ckpt=sam2_model)
     else:
-        print("[5/6] Skipping SAM2 (no model specified, bbox = full image center crop)")
-        _generate_center_bboxes(output_dir, annotated_frames)
+        crop = kwargs.get("crop_fraction", 0.25)
+        print(f"[5/6] Generating center-crop bboxes ({crop:.0%} of image)")
+        _generate_center_bboxes(output_dir, annotated_frames, crop_fraction=crop)
 
     # Step 6: Generate COCO JSON
     print("[6/6] Generating COCO JSON ...")
@@ -866,12 +919,19 @@ def main():
                         help="Path to raw VPT MP4 video files")
     parser.add_argument("--action-root", default=None,
                         help="Action LMDB root (default: data_root/action/)")
-    parser.add_argument("--n-frames", type=int, default=8,
-                        help="Number of frames to select per event (default: 8)")
-    parser.add_argument("--frame-mode", choices=["early_range", "preattack"],
-                        default="early_range",
-                        help="Frame selection mode: early_range (first N of SAM2 "
-                             "tracking window, default) or preattack (N before attack)")
+    parser.add_argument("--n-frames", type=int, default=4,
+                        help="Number of frames to select per event (default: 4)")
+    parser.add_argument("--frame-mode",
+                        choices=["backtrack", "early_range", "preattack"],
+                        default="backtrack",
+                        help="Frame selection: backtrack (go back from event, "
+                             "recommended), early_range, or preattack")
+    parser.add_argument("--skip-tail", type=int, default=8,
+                        help="Frames to skip from event (mining crack animation, "
+                             "default: 8 ≈ 0.4s at 20fps). Only for backtrack mode.")
+    parser.add_argument("--crop-fraction", type=float, default=0.25,
+                        help="Center-crop bbox size as fraction of image "
+                             "(default: 0.25). Only used when --sam2-model is not set.")
     parser.add_argument("--visualize", type=int, default=0,
                         help="Number of samples to visualize")
     parser.add_argument("--sam2-model", default=None,
@@ -888,6 +948,8 @@ def main():
         frame_mode=args.frame_mode,
         max_visualize=args.visualize,
         sam2_model=args.sam2_model,
+        skip_tail=args.skip_tail,
+        crop_fraction=args.crop_fraction,
     )
 
     print("\n" + "=" * 60)
