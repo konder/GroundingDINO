@@ -1043,66 +1043,98 @@ def build_dataset(
         seen_frames.add(frame_key)
         frame_tasks.append(ann)
 
-    if use_raw:
-        # Sort by episode then frame_id for sequential video reads
-        frame_tasks.sort(key=lambda a: (
-            seg_episode_index.get(a.seg_partition, {}).get(a.episode_id, ""),
-            a.frame_id,
-        ))
-
     n_tasks = len(frame_tasks)
     print(f"  Unique frames to export: {n_tasks}", flush=True)
     t_export_start = time.time()
 
-    for task_i, ann in enumerate(frame_tasks):
-        if (task_i + 1) % 500 == 0:
-            elapsed = time.time() - t_export_start
-            rate = (task_i + 1) / elapsed if elapsed > 0 else 0
-            eta = (n_tasks - task_i - 1) / rate if rate > 0 else 0
-            print(f"    Frame {task_i + 1}/{n_tasks} "
-                  f"(exported={exported}, skipped={skipped}, "
-                  f"{rate:.1f} frames/s, ETA {eta:.0f}s) ...", flush=True)
+    if use_raw:
+        # --- Batch-grouped export: group by chunk file, read sequentially ---
+        # Resolve each frame to (chunk_path, local_frame) and group
+        chunk_groups: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+        for ann in frame_tasks:
+            seg_part_name = Path(ann.seg_partition).name if ann.seg_partition else "unk"
+            img_filename = f"{seg_part_name}_ep{ann.episode_id}_f{ann.frame_id:06d}.png"
+            img_path = os.path.join(img_dir, img_filename)
 
-        seg_part_name = Path(ann.seg_partition).name if ann.seg_partition else "unk"
-        img_filename = f"{seg_part_name}_ep{ann.episode_id}_f{ann.frame_id:06d}.png"
-        img_path = os.path.join(img_dir, img_filename)
+            if os.path.exists(img_path):
+                exported += 1
+                continue
 
-        if os.path.exists(img_path):
-            exported += 1
-            continue
-
-        if use_raw:
             part_mapping = seg_episode_index.get(ann.seg_partition, {})
             ep_name = part_mapping.get(ann.episode_id)
             if not ep_name:
-                msg = (f"ep_id={ann.episode_id} in {seg_part_name} "
-                       f"(no mapping in __chunk_infos__)")
-                if msg not in missing_videos:
-                    missing_videos.append(msg)
                 skipped += 1
                 continue
 
-            chunk_info = build_episode_chunk_info(raw_video_index, ep_name)
-            if chunk_info is None:
-                msg = f"{ep_name} (no matching chunks found)"
-                if msg not in missing_videos:
-                    missing_videos.append(msg)
+            info = build_episode_chunk_info(raw_video_index, ep_name)
+            if info is None:
                 skipped += 1
                 continue
 
-            frame = decode_multichunk_frame(raw_video_index, ep_name, ann.frame_id)
-            if frame is not None:
-                cv2.imwrite(img_path, frame,
-                            [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            resolved = info.resolve_frame(ann.frame_id)
+            if resolved is None:
+                skipped += 1
+                continue
+
+            chunk_path, local_frame = resolved
+            chunk_groups[chunk_path].append((local_frame, img_path))
+
+        # Sort frames within each chunk for sequential read
+        for frames_list in chunk_groups.values():
+            frames_list.sort()
+
+        total_chunks = len(chunk_groups)
+        total_frames_to_read = sum(len(v) for v in chunk_groups.values())
+        print(f"  Grouped into {total_chunks} video chunks, "
+              f"{total_frames_to_read} frames to read "
+              f"(skipped {exported} existing, {skipped} missing)", flush=True)
+
+        frames_done = 0
+        for chunk_i, (chunk_path, frames_list) in enumerate(chunk_groups.items()):
+            if (chunk_i + 1) % 100 == 0 or chunk_i == 0:
+                elapsed = time.time() - t_export_start
+                rate = frames_done / elapsed if elapsed > 0 else 0
+                eta = (total_frames_to_read - frames_done) / rate if rate > 0 else 0
+                print(f"    Chunk {chunk_i + 1}/{total_chunks} "
+                      f"({frames_done}/{total_frames_to_read} frames, "
+                      f"{rate:.1f} f/s, ETA {eta:.0f}s)", flush=True)
+
+            cap = cv2.VideoCapture(chunk_path)
+            if not cap.isOpened():
+                skipped += len(frames_list)
+                frames_done += len(frames_list)
+                continue
+
+            for local_frame, img_path in frames_list:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, local_frame)
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    cv2.imwrite(img_path, frame,
+                                [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                    exported += 1
+                else:
+                    skipped += 1
+                frames_done += 1
+
+            cap.release()
+    else:
+        for task_i, ann in enumerate(frame_tasks):
+            if (task_i + 1) % 500 == 0:
+                elapsed = time.time() - t_export_start
+                rate = (task_i + 1) / elapsed if elapsed > 0 else 0
+                eta = (n_tasks - task_i - 1) / rate if rate > 0 else 0
+                print(f"    Frame {task_i + 1}/{n_tasks} "
+                      f"(exported={exported}, skipped={skipped}, "
+                      f"{rate:.1f} frames/s, ETA {eta:.0f}s) ...", flush=True)
+
+            seg_part_name = Path(ann.seg_partition).name if ann.seg_partition else "unk"
+            img_filename = f"{seg_part_name}_ep{ann.episode_id}_f{ann.frame_id:06d}.png"
+            img_path = os.path.join(img_dir, img_filename)
+
+            if os.path.exists(img_path):
                 exported += 1
-            else:
-                total = chunk_info.total_frames
-                msg = (f"frame {ann.frame_id} decode failed in "
-                       f"{Path(chunk_info.chunks[0][0]).name if chunk_info.chunks else ep_name}")
-                if msg not in missing_videos:
-                    missing_videos.append(msg)
-                skipped += 1
-        else:
+                continue
+
             chunk_offset = (ann.frame_id // 32) * 32
             frame_in_chunk = ann.frame_id % 32
             chunk_key_str = f"({ann.episode_id}, {chunk_offset})"
