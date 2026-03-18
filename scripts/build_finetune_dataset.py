@@ -393,6 +393,80 @@ class EpisodeChunkInfo:
         return self.chunks[idx][0], global_frame - self.cumulative[idx]
 
 
+def _build_prefix_index(
+    raw_video_index: Dict[str, str],
+) -> Dict[str, List[Tuple[str, str, str]]]:
+    """Pre-group raw videos by session prefix for O(1) lookup.
+
+    Returns: {prefix: [(timestamp, stem, path), ...]} sorted by timestamp.
+    """
+    groups: Dict[str, List[Tuple[str, str, str]]] = defaultdict(list)
+    for stem, path in raw_video_index.items():
+        prefix, ts = _parse_episode_prefix(stem)
+        groups[prefix].append((ts, stem, path))
+    for v in groups.values():
+        v.sort()
+    return dict(groups)
+
+
+_prefix_index_cache: Dict[int, Dict[str, List[Tuple[str, str, str]]]] = {}
+
+
+def _get_prefix_index(raw_video_index: Dict[str, str]):
+    key = id(raw_video_index)
+    if key not in _prefix_index_cache:
+        _prefix_index_cache[key] = _build_prefix_index(raw_video_index)
+    return _prefix_index_cache[key]
+
+
+# Frame count cache on disk to avoid re-opening MP4s across runs
+def _frame_count_cache_path(raw_video_dir_hash: str) -> str:
+    return f"/tmp/frame_counts_{raw_video_dir_hash}.json"
+
+
+_frame_count_cache: Dict[str, int] = {}
+_frame_count_loaded = False
+
+
+def _load_frame_count_cache():
+    global _frame_count_loaded
+    if _frame_count_loaded:
+        return
+    import glob
+    for f in glob.glob("/tmp/frame_counts_*.json"):
+        try:
+            with open(f) as fh:
+                _frame_count_cache.update(json.load(fh))
+        except (json.JSONDecodeError, IOError):
+            pass
+    _frame_count_loaded = True
+
+
+def _save_frame_count_cache():
+    import hashlib
+    h = hashlib.md5(str(sorted(_frame_count_cache.keys())[:5]).encode()).hexdigest()[:12]
+    try:
+        with open(f"/tmp/frame_counts_{h}.json", "w") as f:
+            json.dump(_frame_count_cache, f)
+    except IOError:
+        pass
+
+
+def _get_frame_count(path: str) -> int:
+    """Get frame count for a video, using disk cache."""
+    _load_frame_count_cache()
+    if path in _frame_count_cache:
+        return _frame_count_cache[path]
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        _frame_count_cache[path] = 0
+        return 0
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    _frame_count_cache[path] = max(n, 0)
+    return max(n, 0)
+
+
 def build_episode_chunk_info(
     raw_video_index: Dict[str, str],
     episode_name: str,
@@ -410,28 +484,20 @@ def build_episode_chunk_info(
         return _cache[episode_name]
 
     prefix, start_ts = _parse_episode_prefix(episode_name)
+    pidx = _get_prefix_index(raw_video_index)
+    all_candidates = pidx.get(prefix, [])
 
-    candidates: List[Tuple[str, str, str]] = []   # (timestamp, stem, path)
-    for stem, path in raw_video_index.items():
-        if stem.startswith(prefix + "-"):
-            ts = stem.rsplit("-", 1)[-1]
-            if ts >= start_ts:
-                candidates.append((ts, stem, path))
+    candidates = [(ts, stem, path) for ts, stem, path in all_candidates
+                  if ts >= start_ts]
 
     if not candidates:
         _cache[episode_name] = None
         return None
 
-    candidates.sort()
-
     chunks: List[Tuple[str, int]] = []
     cumulative = [0]
     for _, _, path in candidates:
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            continue
-        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
+        n = _get_frame_count(path)
         if n <= 0:
             continue
         chunks.append((path, n))
@@ -931,6 +997,7 @@ def build_dataset(
             elif chunk_info and chunk_info.total_frames == 0:
                 corrupted += 1
         build_episode_chunk_info.__defaults__[0].clear()
+        _save_frame_count_cache()
         print(f"  Episodes with raw video: {matched}/{len(needed_names)} "
               f"({total_chunks} total chunks)", flush=True)
         if corrupted:
