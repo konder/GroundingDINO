@@ -740,9 +740,8 @@ def extract_annotations_from_segmentation(
 
     seg_parts = find_lmdb_parts(data_root, "segmentation")
     for seg_i, seg_path in enumerate(seg_parts):
-        if (seg_i + 1) % 20 == 0 or seg_i == 0:
-            print(f"    Processing partition {seg_i + 1}/{len(seg_parts)} "
-                  f"({len(annotations)} annotations so far) ...", flush=True)
+        print(f"    Processing partition {seg_i + 1}/{len(seg_parts)} "
+              f"({len(annotations)} annotations so far) ...", flush=True)
         env = lmdb.open(seg_path, readonly=True, lock=False,
                         readahead=False, map_size=1024**3 * 100)
         with env.begin() as txn:
