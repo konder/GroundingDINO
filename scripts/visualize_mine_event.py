@@ -198,42 +198,41 @@ def main():
         print("  ERROR: no matching event found with image data")
         return
 
-    # Collect ALL masks for this event
+    # Collect masks only for the frames we need to display
+    fr_start, fr_end = found_event["frame_range"]
+    n = args.n_frames
+    show_start = max(fr_start, fr_end - n + 1)
+
     seg_env = lmdb.open(found_event["seg_part"], readonly=True, lock=False,
                         readahead=False, map_size=1024**3 * 100)
+    chunks_to_read = set()
+    for gf in range(show_start, fr_end + 1):
+        chunks_to_read.add((gf // 32) * 32)
+
     with seg_env.begin() as txn:
-        for key_raw, val_raw in txn.cursor():
-            ks = key_raw.decode()
-            if ks.startswith("__"):
+        for chunk_off in sorted(chunks_to_read):
+            key = f"({found_event['seg_ep_idx']}, {chunk_off})"
+            raw = txn.get(key.encode())
+            if raw is None:
                 continue
-            ck = eval(ks)
-            if ck[0] != found_event["seg_ep_idx"]:
-                continue
-            fo = ck[1]
-            frames = pickle.loads(val_raw)
+            frames = pickle.loads(raw)
             for fi, fd in enumerate(frames):
-                gf = fo + fi
+                gf = chunk_off + fi
+                if gf < show_start or gf > fr_end:
+                    continue
                 for ek, ev in fd.items():
                     if not isinstance(ev, dict):
                         continue
                     if ev.get("event") != target_event:
                         continue
-                    fr_check = ev.get("frame_range")
-                    if fr_check and tuple(fr_check) == found_event["frame_range"]:
-                        rle = ev.get("rle_mask", "")
-                        pt = ev.get("point")
-                        if rle:
-                            event_masks[gf] = (rle, pt)
+                    rle = ev.get("rle_mask", "")
+                    pt = ev.get("point")
+                    if rle:
+                        event_masks[gf] = (rle, pt)
     seg_env.close()
-    print(f"  Masks: {len(event_masks)} frames "
-          f"(gf {min(event_masks)}..{max(event_masks)})", flush=True)
+    print(f"  Masks: {len(event_masks)} frames", flush=True)
 
     # ── Step 3: read frames from image LMDB ──
-    fr_start, fr_end = found_event["frame_range"]
-    n = args.n_frames
-    # Show last n frames ending at fr_end (the event frame)
-    show_start = max(fr_start, fr_end - n + 1)
-
     print(f"[3/4] Reading frames {show_start}..{fr_end} from image LMDB...", flush=True)
 
     img_env = lmdb.open(found_event["img_part"], readonly=True, lock=False,
