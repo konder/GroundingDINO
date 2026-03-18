@@ -28,6 +28,7 @@ import pickle
 import re
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -953,25 +954,49 @@ def build_dataset(
         return {"annotations": 0}
 
     print(f"[3/5] Exporting frame images to {output_dir}/images/ ...", flush=True)
-    os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
+    img_dir = os.path.join(output_dir, "images")
+    os.makedirs(img_dir, exist_ok=True)
     exported = 0
     skipped = 0
     seen_frames = set()
     missing_videos: List[str] = []
-    n_total_anns = len(annotations)
 
-    for ann_i, ann in enumerate(annotations):
-        if (ann_i + 1) % 500 == 0:
-            print(f"    Frame {ann_i + 1}/{n_total_anns} "
-                  f"(exported={exported}, skipped={skipped}) ...", flush=True)
+    # Deduplicate and collect unique frames
+    frame_tasks = []
+    for ann in annotations:
         frame_key = (ann.seg_partition, ann.episode_id, ann.frame_id)
         if frame_key in seen_frames:
             continue
         seen_frames.add(frame_key)
+        frame_tasks.append(ann)
+
+    if use_raw:
+        # Sort by episode then frame_id for sequential video reads
+        frame_tasks.sort(key=lambda a: (
+            seg_episode_index.get(a.seg_partition, {}).get(a.episode_id, ""),
+            a.frame_id,
+        ))
+
+    n_tasks = len(frame_tasks)
+    print(f"  Unique frames to export: {n_tasks}", flush=True)
+    t_export_start = time.time()
+
+    for task_i, ann in enumerate(frame_tasks):
+        if (task_i + 1) % 500 == 0:
+            elapsed = time.time() - t_export_start
+            rate = (task_i + 1) / elapsed if elapsed > 0 else 0
+            eta = (n_tasks - task_i - 1) / rate if rate > 0 else 0
+            print(f"    Frame {task_i + 1}/{n_tasks} "
+                  f"(exported={exported}, skipped={skipped}, "
+                  f"{rate:.1f} frames/s, ETA {eta:.0f}s) ...", flush=True)
 
         seg_part_name = Path(ann.seg_partition).name if ann.seg_partition else "unk"
         img_filename = f"{seg_part_name}_ep{ann.episode_id}_f{ann.frame_id:06d}.png"
-        img_path = os.path.join(output_dir, "images", img_filename)
+        img_path = os.path.join(img_dir, img_filename)
+
+        if os.path.exists(img_path):
+            exported += 1
+            continue
 
         if use_raw:
             part_mapping = seg_episode_index.get(ann.seg_partition, {})
@@ -981,7 +1006,6 @@ def build_dataset(
                        f"(no mapping in __chunk_infos__)")
                 if msg not in missing_videos:
                     missing_videos.append(msg)
-                    print(f"  MISS: {msg}")
                 skipped += 1
                 continue
 
@@ -990,18 +1014,20 @@ def build_dataset(
                 msg = f"{ep_name} (no matching chunks found)"
                 if msg not in missing_videos:
                     missing_videos.append(msg)
-                    print(f"  MISS: {msg}")
                 skipped += 1
                 continue
 
             frame = decode_multichunk_frame(raw_video_index, ep_name, ann.frame_id)
             if frame is not None:
-                cv2.imwrite(img_path, frame)
+                cv2.imwrite(img_path, frame,
+                            [cv2.IMWRITE_PNG_COMPRESSION, 1])
                 exported += 1
             else:
                 total = chunk_info.total_frames
-                print(f"  MISS: frame {ann.frame_id} (total={total}) "
-                      f"in {ep_name} ({len(chunk_info.chunks)} chunks)")
+                msg = (f"frame {ann.frame_id} decode failed in "
+                       f"{Path(chunk_info.chunks[0][0]).name if chunk_info.chunks else ep_name}")
+                if msg not in missing_videos:
+                    missing_videos.append(msg)
                 skipped += 1
         else:
             chunk_offset = (ann.frame_id // 32) * 32
