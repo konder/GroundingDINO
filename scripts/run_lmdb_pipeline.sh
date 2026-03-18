@@ -43,7 +43,8 @@ python scripts/build_lmdb_dataset.py \
     --skip-tail 4 \
     --min-mask-area 3000 \
     --max-mask-area 0.35 \
-    --visualize 50
+    --visualize 50 \
+    --workers 0
 
 echo ""
 echo "============================================"

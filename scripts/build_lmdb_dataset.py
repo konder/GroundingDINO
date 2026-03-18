@@ -564,6 +564,228 @@ def _print(*args, **kwargs):
     print(*args, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Multiprocess worker for Step 3
+# ---------------------------------------------------------------------------
+
+def _process_events_worker(args):
+    """Self-contained worker: process a batch of events, return annotations.
+
+    Each worker maintains its own LMDB env cache and image chunk LRU cache
+    to avoid cross-process sharing issues. On completion, saves a checkpoint
+    file so interrupted runs can resume.
+    """
+    (events_batch, img_dir, mask_hw, n_frames, skip_tail,
+     min_mask_area, max_mask_area_frac, filter_gui,
+     worker_id, total_workers, output_dir) = args
+
+    os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
+    os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+
+    envs: Dict[str, lmdb.Environment] = {}
+    img_chunk_cache: Dict[Tuple, Optional[List[np.ndarray]]] = {}
+    IMG_CACHE_MAX = 48
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+
+    def get_env(path):
+        if path not in envs:
+            envs[path] = lmdb.open(
+                path, readonly=True, lock=False,
+                readahead=False, map_size=1024**3 * 100)
+        return envs[path]
+
+    def decode_chunk_cached(img_part, ep_idx, chunk_off):
+        cache_key = (img_part, ep_idx, chunk_off)
+        if cache_key in img_chunk_cache:
+            return img_chunk_cache[cache_key]
+
+        lmdb_key = f"({ep_idx}, {chunk_off})"
+        env = get_env(img_part)
+        with env.begin() as txn:
+            raw = txn.get(lmdb_key.encode())
+            if raw is None:
+                img_chunk_cache[cache_key] = None
+                return None
+
+        with open(tmp_path, "wb") as f:
+            f.write(raw)
+
+        frames = []
+        cap = cv2.VideoCapture(tmp_path)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(frame)
+        cap.release()
+        result = frames if frames else None
+
+        if len(img_chunk_cache) >= IMG_CACHE_MAX:
+            img_chunk_cache.pop(next(iter(img_chunk_cache)))
+        img_chunk_cache[cache_key] = result
+        return result
+
+    annotations = []
+    stats = defaultdict(int)
+    max_pixels = int(mask_hw[0] * mask_hw[1] * max_mask_area_frac)
+    t0 = time.time()
+
+    for i, ev in enumerate(events_batch):
+        if (i + 1) % 2000 == 0 or i == 0:
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            _print(f"    [W{worker_id}] {i+1}/{len(events_batch)} "
+                   f"({stats['frames_exported']} frames, {rate:.1f} ev/s)")
+
+        candidate_frames = select_training_frames(
+            ev.frame_start, ev.frame_end, n_frames, skip_tail)
+        if not candidate_frames:
+            stats["events_no_valid_frames"] += 1
+            continue
+
+        # --- Collect masks from segmentation LMDB ---
+        frame_set = set(candidate_frames)
+        seg_chunks = set((gf // 32) * 32 for gf in candidate_frames)
+        masks = {}
+
+        seg_env = get_env(ev.seg_part)
+        with seg_env.begin() as txn:
+            for chunk_off in seg_chunks:
+                raw = txn.get(f"({ev.seg_ep_idx}, {chunk_off})".encode())
+                if raw is None:
+                    continue
+                frames_data = pickle.loads(raw)
+                for fi, fd in enumerate(frames_data):
+                    gf = chunk_off + fi
+                    if gf not in frame_set:
+                        continue
+                    for ek, ev_data in fd.items():
+                        if not isinstance(ev_data, dict):
+                            continue
+                        if ev_data.get("event") != ev.event_name:
+                            continue
+                        rle = ev_data.get("rle_mask", "")
+                        if not rle:
+                            continue
+                        area = compute_mask_area(rle)
+                        if area < min_mask_area or area > max_pixels:
+                            continue
+                        point = ev_data.get("point")
+                        pt = tuple(point) if point else None
+                        mask = rle_to_mask(rle, mask_hw[0], mask_hw[1])
+                        mask = filter_mask_by_point(mask, pt)
+                        bbox = mask_to_bbox(mask)
+                        if bbox:
+                            masks[gf] = (bbox, pt)
+
+        valid_frames = [f for f in candidate_frames if f in masks]
+        if not valid_frames:
+            stats["frames_no_mask"] += len(candidate_frames)
+            stats["events_no_valid_frames"] += 1
+            continue
+
+        # --- Decode image frames (with LRU cache) ---
+        vf_set = set(valid_frames)
+        img_chunks = set((gf // 32) * 32 for gf in valid_frames)
+        decoded = {}
+        for chunk_off in sorted(img_chunks):
+            chunk_frames = decode_chunk_cached(
+                ev.img_part, ev.img_ep_idx, chunk_off)
+            if chunk_frames:
+                for fi, frame in enumerate(chunk_frames):
+                    gf = chunk_off + fi
+                    if gf in vf_set:
+                        decoded[gf] = frame
+
+        # --- Filter + write ---
+        has_any = False
+        for gf in valid_frames:
+            if gf not in decoded:
+                stats["frames_no_image"] += 1
+                continue
+            frame = decoded[gf]
+            if filter_gui and detect_gui_frame(frame):
+                stats["frames_gui_filtered"] += 1
+                continue
+
+            h_img, w_img = frame.shape[:2]
+            bbox_scaled = scale_bbox_to_image(
+                masks[gf][0], mask_hw, (h_img, w_img))
+            seg_part_name = Path(ev.seg_part).name
+            img_filename = f"{seg_part_name}_ep{ev.seg_ep_idx}_f{gf:06d}.png"
+            img_path = os.path.join(img_dir, img_filename)
+            if not os.path.exists(img_path):
+                cv2.imwrite(img_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+
+            annotations.append({
+                "image_file": img_filename,
+                "category": ev.label,
+                "bbox": bbox_scaled,
+                "image_width": w_img,
+                "image_height": h_img,
+            })
+            stats["frames_exported"] += 1
+            has_any = True
+
+        if not has_any:
+            stats["events_no_valid_frames"] += 1
+        stats["events_processed"] += 1
+
+    # Cleanup
+    for e in envs.values():
+        try:
+            e.close()
+        except Exception:
+            pass
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+
+    result_stats = dict(stats)
+    _save_checkpoint(output_dir, worker_id, annotations, result_stats)
+    _print(f"    [W{worker_id}] Done: {len(annotations)} annotations saved "
+           f"to checkpoint")
+
+    return annotations, result_stats
+
+
+def _checkpoint_path(output_dir: str, worker_id: int) -> str:
+    return os.path.join(output_dir, f".checkpoint_w{worker_id}.json")
+
+
+def _save_checkpoint(output_dir: str, worker_id: int,
+                     annotations: List[Dict], stats: Dict) -> None:
+    path = _checkpoint_path(output_dir, worker_id)
+    try:
+        with open(path, "w") as f:
+            json.dump({"annotations": annotations, "stats": stats}, f)
+    except IOError:
+        pass
+
+
+def _load_checkpoint(output_dir: str, worker_id: int
+                     ) -> Optional[Tuple[List[Dict], Dict]]:
+    path = _checkpoint_path(output_dir, worker_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data["annotations"], data["stats"]
+    except (json.JSONDecodeError, KeyError, IOError):
+        return None
+
+
+def _clean_checkpoints(output_dir: str, n_workers: int) -> None:
+    for wi in range(n_workers):
+        path = _checkpoint_path(output_dir, wi)
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def build_dataset(
     data_roots: List[str],
     output_dir: str,
@@ -573,6 +795,7 @@ def build_dataset(
     max_mask_area_frac: float = 0.35,
     filter_gui: bool = True,
     max_visualize: int = 0,
+    n_workers: int = 0,
 ) -> Dict:
     """Main pipeline: build GroundingDINO training data from MineStudio LMDBs.
 
@@ -637,122 +860,102 @@ def build_dataset(
     if len(label_counts) > 20:
         _print(f"    ... and {len(label_counts) - 20} more categories")
 
-    # --- Step 3 & 4: Extract frames + masks ---
-    _print(f"[3/5] Extracting frames and masks (n_frames={n_frames}, "
-           f"skip_tail={skip_tail})...")
-
-    # Group events by (seg_part, img_part) for locality
-    from itertools import groupby
-    events_sorted = sorted(events, key=lambda e: (e.seg_part, e.img_part))
-    groups = []
-    for key, grp in groupby(events_sorted, key=lambda e: (e.seg_part, e.img_part)):
-        groups.append((key, list(grp)))
-    _print(f"  {len(events)} events in {len(groups)} partition groups")
-
-    all_annotations = []
-    stats = {
-        "events_processed": 0,
-        "events_no_valid_frames": 0,
-        "frames_exported": 0,
-        "frames_gui_filtered": 0,
-        "frames_no_mask": 0,
-        "frames_no_image": 0,
-    }
-
-    t_start = time.time()
-    ev_global = 0
-    progress_interval = max(1, min(200, len(events) // 20))
-
-    for grp_i, ((seg_part, img_part), grp_events) in enumerate(groups):
-        _print(f"  Group {grp_i+1}/{len(groups)}: "
-               f"{Path(seg_part).name} ↔ {Path(img_part).name} "
-               f"({len(grp_events)} events)")
-
-        for ev in grp_events:
-            ev_global += 1
-            if ev_global % progress_interval == 0:
-                elapsed = time.time() - t_start
-                rate = ev_global / elapsed if elapsed > 0 else 0
-                eta = (len(events) - ev_global) / rate if rate > 0 else 0
-                _print(f"    Event {ev_global}/{len(events)} "
-                       f"({stats['frames_exported']} frames, "
-                       f"{rate:.1f} ev/s, ETA {eta:.0f}s)")
-
-            candidate_frames = select_training_frames(
-                ev.frame_start, ev.frame_end, n_frames, skip_tail)
-            if not candidate_frames:
-                stats["events_no_valid_frames"] += 1
-                continue
-
-            masks = _collect_masks_for_frames(
-                ev.seg_part, ev.seg_ep_idx, ev.event_name,
-                candidate_frames,
-                mask_h=mask_hw[0], mask_w=mask_hw[1],
-                min_mask_area=min_mask_area,
-                max_mask_area_frac=max_mask_area_frac,
-            )
-
-            valid_frames = [f for f in candidate_frames if f in masks]
-            if not valid_frames:
-                stats["frames_no_mask"] += len(candidate_frames)
-                stats["events_no_valid_frames"] += 1
-                continue
-
-            decoded = _decode_frames_from_image_lmdb(
-                ev.img_part, ev.img_ep_idx, valid_frames)
-
-            has_any = False
-            for gf in valid_frames:
-                if gf not in decoded:
-                    stats["frames_no_image"] += 1
-                    continue
-
-                frame = decoded[gf]
-                if filter_gui and detect_gui_frame(frame):
-                    stats["frames_gui_filtered"] += 1
-                    continue
-
-                h_img, w_img = frame.shape[:2]
-                bbox_mask = masks[gf][0]
-                bbox_scaled = scale_bbox_to_image(bbox_mask, mask_hw, (h_img, w_img))
-
-                seg_part_name = Path(ev.seg_part).name
-                img_filename = f"{seg_part_name}_ep{ev.seg_ep_idx}_f{gf:06d}.png"
-                img_path = os.path.join(img_dir, img_filename)
-
-                if not os.path.exists(img_path):
-                    cv2.imwrite(img_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
-
-                all_annotations.append({
-                    "image_file": img_filename,
-                    "category": ev.label,
-                    "bbox": bbox_scaled,
-                    "image_width": w_img,
-                    "image_height": h_img,
-                })
-                stats["frames_exported"] += 1
-                has_any = True
-
-            if not has_any:
-                stats["events_no_valid_frames"] += 1
-            stats["events_processed"] += 1
-
+    # --- Step 3 & 4: Extract frames + masks (multiprocess with checkpoint) ---
     _close_all_envs()
 
-    elapsed_total = time.time() - t_start
-    _print(f"  Done in {elapsed_total:.1f}s")
-    _print(f"  Processed {stats['events_processed']} events")
-    _print(f"  Exported {stats['frames_exported']} frames")
-    _print(f"  No valid frames: {stats['events_no_valid_frames']} events")
-    _print(f"  GUI filtered: {stats['frames_gui_filtered']} frames")
-    _print(f"  No mask: {stats['frames_no_mask']} frames")
-    _print(f"  No image data: {stats['frames_no_image']} frames")
+    if n_workers <= 0:
+        n_workers = min(os.cpu_count() or 4, 16)
+    _print(f"[3/5] Extracting frames and masks (n_frames={n_frames}, "
+           f"skip_tail={skip_tail}, workers={n_workers})...")
 
-    # Cleanup tempfile used by decode_image_chunk
-    tmp_path = getattr(decode_image_chunk, "_tmp_path", None)
-    if tmp_path and os.path.exists(tmp_path):
-        os.unlink(tmp_path)
-        decode_image_chunk._tmp_path = None
+    # Sort by (seg_part, img_part) for LMDB locality within each worker
+    events_sorted = sorted(events, key=lambda e: (e.seg_part, e.img_part))
+
+    # Determine actual number of batches
+    actual_workers = max(1, min(n_workers, len(events_sorted)))
+    if len(events_sorted) <= 100:
+        actual_workers = 1
+    chunk_size = (len(events_sorted) + actual_workers - 1) // actual_workers
+
+    # Check existing checkpoints for resume
+    loaded_anns: Dict[int, List[Dict]] = {}
+    loaded_stats: Dict[int, Dict] = {}
+    pending_workers = []
+
+    for wi in range(actual_workers):
+        start = wi * chunk_size
+        end = min(start + chunk_size, len(events_sorted))
+        if start >= len(events_sorted):
+            break
+        cached = _load_checkpoint(output_dir, wi)
+        if cached is not None:
+            loaded_anns[wi] = cached[0]
+            loaded_stats[wi] = cached[1]
+        else:
+            pending_workers.append(wi)
+
+    if loaded_anns:
+        _print(f"  Resumed {len(loaded_anns)}/{actual_workers} workers "
+               f"from checkpoint "
+               f"({sum(len(a) for a in loaded_anns.values())} annotations)")
+
+    all_annotations = []
+    stats = defaultdict(int)
+    t_start = time.time()
+
+    # Merge already-completed workers
+    for wi in sorted(loaded_anns):
+        all_annotations.extend(loaded_anns[wi])
+        for k, v in loaded_stats[wi].items():
+            stats[k] += v
+
+    if not pending_workers:
+        _print(f"  All workers completed from checkpoint, skipping Step 3")
+    elif actual_workers > 1:
+        batches = []
+        for wi in pending_workers:
+            start = wi * chunk_size
+            end = min(start + chunk_size, len(events_sorted))
+            batches.append((
+                events_sorted[start:end], img_dir, mask_hw,
+                n_frames, skip_tail, min_mask_area, max_mask_area_frac,
+                filter_gui, wi, actual_workers, output_dir,
+            ))
+
+        _print(f"  Dispatching {sum(len(b[0]) for b in batches)} events to "
+               f"{len(batches)} workers "
+               f"(~{chunk_size} events each)")
+
+        import multiprocessing as mp
+        ctx = mp.get_context("fork")
+        with ctx.Pool(len(batches)) as pool:
+            results = pool.map(_process_events_worker, batches)
+
+        for worker_anns, worker_stats in results:
+            all_annotations.extend(worker_anns)
+            for k, v in worker_stats.items():
+                stats[k] += v
+    else:
+        _print(f"  Single-process mode ({len(events_sorted)} events)")
+        result = _process_events_worker((
+            events_sorted, img_dir, mask_hw,
+            n_frames, skip_tail, min_mask_area, max_mask_area_frac,
+            filter_gui, 0, 1, output_dir,
+        ))
+        all_annotations.extend(result[0])
+        for k, v in result[1].items():
+            stats[k] += v
+
+    elapsed_total = time.time() - t_start
+    total_ev = len(events_sorted)
+    rate = total_ev / elapsed_total if elapsed_total > 0 else 0
+    _print(f"  Done in {elapsed_total:.1f}s ({rate:.1f} ev/s overall)")
+    _print(f"  Processed {stats.get('events_processed', 0)} events")
+    _print(f"  Exported {stats.get('frames_exported', 0)} frames")
+    _print(f"  No valid frames: {stats.get('events_no_valid_frames', 0)} events")
+    _print(f"  GUI filtered: {stats.get('frames_gui_filtered', 0)} frames")
+    _print(f"  No mask: {stats.get('frames_no_mask', 0)} frames")
+    _print(f"  No image data: {stats.get('frames_no_image', 0)} frames")
 
     # --- Step 4: COCO output ---
     _print(f"[4/5] Building COCO annotations...")
@@ -810,10 +1013,14 @@ def build_dataset(
         "total_annotations": len(coco["annotations"]),
         "total_categories": len(coco["categories"]),
         "category_counts": dict(cat_counts),
-        "stats": stats,
+        "stats": dict(stats),
     }
     with open(os.path.join(output_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
+
+    # All steps done successfully — clean up checkpoint files
+    _clean_checkpoints(output_dir, actual_workers)
+    _print("  Cleaned up checkpoint files")
 
     return summary
 
@@ -839,6 +1046,8 @@ def main():
                         help="Disable GUI frame detection")
     parser.add_argument("--visualize", type=int, default=0,
                         help="Number of visualization samples (default: 0)")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Number of parallel workers (0=auto, 1=single-process)")
 
     args = parser.parse_args()
 
@@ -851,6 +1060,7 @@ def main():
         max_mask_area_frac=args.max_mask_area,
         filter_gui=not args.no_gui_filter,
         max_visualize=args.visualize,
+        n_workers=args.workers,
     )
 
     _print("\n" + "=" * 60)
