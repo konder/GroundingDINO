@@ -1110,6 +1110,115 @@ def generate_quality_report(output_dir: str, all_annotations: List[Dict],
     return report_path
 
 
+def _scan_events_fast(
+    data_roots: List[str],
+    seg_ep_map: Dict,
+    img_ep_map: Dict,
+    n_per_cat: int = 5,
+    max_total: int = 500,
+) -> List[EventRecord]:
+    """Fast event scan for preview: stops early once enough samples found.
+
+    Stops scanning when we have at least n_per_cat events for 10+ categories
+    and at least max_total events total, OR after scanning 5% of chunks.
+    """
+    events: List[EventRecord] = []
+    seen = set()
+    cat_counts: Dict[str, int] = defaultdict(int)
+
+    matched_eps: Dict[str, Set[int]] = defaultdict(set)
+    for (part_path, ep_idx), ep_name in seg_ep_map.items():
+        if ep_name in img_ep_map:
+            matched_eps[part_path].add(ep_idx)
+
+    all_seg_parts = []
+    for root in data_roots:
+        seg_dir = os.path.join(root, "segmentation")
+        all_seg_parts.extend(_find_lmdb_parts(seg_dir))
+
+    stop = False
+    t0 = time.time()
+    for part_i, part_path in enumerate(all_seg_parts):
+        if stop:
+            break
+        part_matched = matched_eps.get(part_path, set())
+        if not part_matched:
+            continue
+
+        env = lmdb.open(part_path, readonly=True, lock=False,
+                        readahead=False, map_size=1024**3 * 100)
+        with env.begin() as txn:
+            n_entries = txn.stat()["entries"]
+            max_scan = max(n_entries // 20, 2000)  # scan up to 5%
+            chunk_count = 0
+            for key_raw, val_raw in txn.cursor():
+                ks = key_raw.decode()
+                if ks.startswith("__"):
+                    continue
+                chunk_count += 1
+
+                if chunk_count % 2000 == 0:
+                    elapsed = time.time() - t0
+                    _print(f"      chunk {chunk_count}/{n_entries} "
+                           f"({len(events)} events, "
+                           f"{len(cat_counts)} categories, {elapsed:.0f}s)")
+
+                chunk_key = eval(ks)
+                ep_idx, frame_offset = chunk_key
+                if ep_idx not in part_matched:
+                    continue
+
+                ep_name = seg_ep_map[(part_path, ep_idx)]
+                frames = pickle.loads(val_raw)
+                for fi, fd in enumerate(frames):
+                    gf = frame_offset + fi
+                    for ek, ev in fd.items():
+                        if not isinstance(ev, dict):
+                            continue
+                        event_name = ev.get("event", "")
+                        label = parse_event_label(event_name)
+                        if label is None:
+                            continue
+                        fr = ev.get("frame_range")
+                        if not fr:
+                            continue
+                        if gf != fr[1]:
+                            continue
+                        dedup_key = (ep_name, event_name, fr[0], fr[1])
+                        if dedup_key in seen:
+                            continue
+                        seen.add(dedup_key)
+
+                        img_part, img_eidx = img_ep_map[ep_name]
+                        events.append(EventRecord(
+                            event_name=event_name, label=label,
+                            ep_name=ep_name, seg_part=part_path,
+                            seg_ep_idx=ep_idx, img_part=img_part,
+                            img_ep_idx=img_eidx,
+                            frame_start=fr[0], frame_end=fr[1],
+                        ))
+                        cat_counts[label] += 1
+
+                # Early exit: enough samples collected
+                cats_with_enough = sum(
+                    1 for c in cat_counts.values() if c >= n_per_cat)
+                if (len(events) >= max_total and
+                        cats_with_enough >= min(10, len(cat_counts))):
+                    _print(f"      Early stop: {len(events)} events, "
+                           f"{len(cat_counts)} categories "
+                           f"({cats_with_enough} with >= {n_per_cat})")
+                    stop = True
+                    break
+
+                if chunk_count >= max_scan:
+                    _print(f"      Scanned {max_scan} chunks (5% of partition)")
+                    break
+
+        env.close()
+
+    return events
+
+
 def preview_dataset(
     data_roots: List[str],
     output_dir: str,
@@ -1122,6 +1231,7 @@ def preview_dataset(
 ) -> None:
     """Quick preview mode: sample a few events per category to evaluate quality.
 
+    Uses fast early-stopping scan instead of full LMDB scan.
     Runs single-process on a small subset for fast parameter tuning.
     Generates a visual report grid.
     """
@@ -1135,10 +1245,10 @@ def preview_dataset(
            f"min_mask_area={min_mask_area}, "
            f"max_mask_area={max_mask_area_frac:.0%}")
 
-    # Step 1-2: reuse normal pipeline
-    _print("[1/3] Building maps and scanning events...")
+    _print("[1/3] Building maps and fast-scanning events...")
     seg_ep_map, img_ep_map = _build_episode_maps(data_roots)
 
+    # Check for full event cache first (from a previous full run)
     cache_key = hashlib.md5(
         f"{sorted(data_roots)}|{min_mask_area}|{max_mask_area_frac}".encode()
     ).hexdigest()[:12]
@@ -1149,19 +1259,17 @@ def preview_dataset(
         try:
             with open(event_cache_path) as f:
                 events = [EventRecord(**e) for e in json.load(f)]
-            _print(f"  Loaded {len(events)} events from cache")
+            _print(f"  Loaded {len(events)} events from full cache")
         except (json.JSONDecodeError, TypeError):
             events = None
+
     if events is None:
-        events = _scan_events(
+        # Fast scan: only scan enough chunks to find preview samples
+        max_total = n_events_per_cat * 100
+        events = _scan_events_fast(
             data_roots, seg_ep_map, img_ep_map,
-            min_mask_area=min_mask_area,
-            max_mask_area_frac=max_mask_area_frac)
-        try:
-            with open(event_cache_path, "w") as f:
-                json.dump([vars(e) for e in events], f)
-        except IOError:
-            pass
+            n_per_cat=n_events_per_cat, max_total=max_total)
+        _print(f"  Fast scan found {len(events)} events")
 
     # Sample events: up to n_events_per_cat per category
     import random
