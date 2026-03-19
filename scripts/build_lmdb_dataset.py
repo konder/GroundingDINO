@@ -713,8 +713,9 @@ def _process_events_worker(args):
             h_img, w_img = frame.shape[:2]
             bbox_scaled = scale_bbox_to_image(
                 masks[gf][0], mask_hw, (h_img, w_img))
+            ds_name = Path(ev.seg_part).parent.parent.name
             seg_part_name = Path(ev.seg_part).name
-            img_filename = f"{seg_part_name}_ep{ev.seg_ep_idx}_f{gf:06d}.png"
+            img_filename = f"{ds_name}_{seg_part_name}_ep{ev.seg_ep_idx}_f{gf:06d}.png"
             img_path = os.path.join(img_dir, img_filename)
             if not os.path.exists(img_path):
                 cv2.imwrite(img_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
@@ -1025,6 +1026,204 @@ def build_dataset(
     return summary
 
 
+# ---------------------------------------------------------------------------
+# Preview / quality report
+# ---------------------------------------------------------------------------
+
+def generate_quality_report(output_dir: str, all_annotations: List[Dict],
+                            max_per_cat: int = 6) -> str:
+    """Generate a visual quality report: grid of sample images per category.
+
+    Returns path to the saved report image.
+    """
+    img_dir = os.path.join(output_dir, "images")
+
+    # Group annotations by category
+    by_cat: Dict[str, List[Dict]] = defaultdict(list)
+    for ann in all_annotations:
+        by_cat[ann["category"]].append(ann)
+
+    cats = sorted(by_cat.keys(), key=lambda c: -len(by_cat[c]))
+    n_cats = min(len(cats), 20)
+    if n_cats == 0:
+        return ""
+
+    cols = max_per_cat
+    rows = n_cats
+    cell_w, cell_h = 240, 240
+    margin = 120  # left margin for category labels
+    grid = np.zeros((rows * cell_h, margin + cols * cell_w, 3), dtype=np.uint8)
+
+    for ri, cat in enumerate(cats[:n_cats]):
+        # Category label
+        y_text = ri * cell_h + cell_h // 2
+        label = f"{cat} ({len(by_cat[cat])})"
+        cv2.putText(grid, label, (5, y_text),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+        samples = by_cat[cat][:max_per_cat]
+        for ci, ann in enumerate(samples):
+            img_path = os.path.join(img_dir, ann["image_file"])
+            if not os.path.exists(img_path):
+                continue
+            img = cv2.imread(img_path)
+            if img is None:
+                continue
+
+            # Draw bbox
+            x, y, w, h = [int(v) for v in ann["bbox"]]
+            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            # Resize to cell
+            thumb = cv2.resize(img, (cell_w, cell_h),
+                               interpolation=cv2.INTER_AREA)
+            # Bbox size info
+            bw, bh = ann["bbox"][2], ann["bbox"][3]
+            info = f"{int(bw)}x{int(bh)}"
+            cv2.putText(thumb, info, (5, cell_h - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
+
+            grid[ri * cell_h:(ri + 1) * cell_h,
+                 margin + ci * cell_w:margin + (ci + 1) * cell_w] = thumb
+
+    report_path = os.path.join(output_dir, "quality_report.png")
+    cv2.imwrite(report_path, grid)
+
+    # Text summary
+    bbox_widths = [a["bbox"][2] for a in all_annotations]
+    bbox_heights = [a["bbox"][3] for a in all_annotations]
+    summary_lines = [
+        f"Total: {len(all_annotations)} annotations, "
+        f"{len(set(a['image_file'] for a in all_annotations))} images, "
+        f"{len(by_cat)} categories",
+        f"Bbox size: width {np.min(bbox_widths):.0f}-{np.max(bbox_widths):.0f} "
+        f"(median {np.median(bbox_widths):.0f}), "
+        f"height {np.min(bbox_heights):.0f}-{np.max(bbox_heights):.0f} "
+        f"(median {np.median(bbox_heights):.0f})",
+        f"Top categories: " + ", ".join(
+            f"{c}({len(by_cat[c])})" for c in cats[:10]),
+    ]
+    report_txt = os.path.join(output_dir, "quality_report.txt")
+    with open(report_txt, "w") as f:
+        f.write("\n".join(summary_lines))
+
+    return report_path
+
+
+def preview_dataset(
+    data_roots: List[str],
+    output_dir: str,
+    n_events_per_cat: int = 5,
+    n_frames: int = 4,
+    skip_tail: int = 4,
+    min_mask_area: int = 3000,
+    max_mask_area_frac: float = 0.35,
+    filter_gui: bool = True,
+) -> None:
+    """Quick preview mode: sample a few events per category to evaluate quality.
+
+    Runs single-process on a small subset for fast parameter tuning.
+    Generates a visual report grid.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    img_dir = os.path.join(output_dir, "images")
+    os.makedirs(img_dir, exist_ok=True)
+    mask_hw = (360, 640)
+
+    _print(f"=== PREVIEW MODE ({n_events_per_cat} events/category) ===")
+    _print(f"  Params: n_frames={n_frames}, skip_tail={skip_tail}, "
+           f"min_mask_area={min_mask_area}, "
+           f"max_mask_area={max_mask_area_frac:.0%}")
+
+    # Step 1-2: reuse normal pipeline
+    _print("[1/3] Building maps and scanning events...")
+    seg_ep_map, img_ep_map = _build_episode_maps(data_roots)
+
+    cache_key = hashlib.md5(
+        f"{sorted(data_roots)}|{min_mask_area}|{max_mask_area_frac}".encode()
+    ).hexdigest()[:12]
+    event_cache_path = f"/tmp/lmdb_events_{cache_key}.json"
+
+    events = None
+    if os.path.exists(event_cache_path):
+        try:
+            with open(event_cache_path) as f:
+                events = [EventRecord(**e) for e in json.load(f)]
+            _print(f"  Loaded {len(events)} events from cache")
+        except (json.JSONDecodeError, TypeError):
+            events = None
+    if events is None:
+        events = _scan_events(
+            data_roots, seg_ep_map, img_ep_map,
+            min_mask_area=min_mask_area,
+            max_mask_area_frac=max_mask_area_frac)
+        try:
+            with open(event_cache_path, "w") as f:
+                json.dump([vars(e) for e in events], f)
+        except IOError:
+            pass
+
+    # Sample events: up to n_events_per_cat per category
+    import random
+    by_cat: Dict[str, List[EventRecord]] = defaultdict(list)
+    for ev in events:
+        by_cat[ev.label].append(ev)
+    sampled = []
+    for cat, cat_events in sorted(by_cat.items(), key=lambda x: -len(x[1])):
+        sample = random.sample(cat_events, min(n_events_per_cat, len(cat_events)))
+        sampled.extend(sample)
+    _print(f"  Sampled {len(sampled)} events from {len(by_cat)} categories")
+
+    # Step 2: Process sampled events (single process)
+    _print(f"[2/3] Processing {len(sampled)} events...")
+    _close_all_envs()
+    result = _process_events_worker((
+        sampled, img_dir, mask_hw,
+        n_frames, skip_tail, min_mask_area, max_mask_area_frac,
+        filter_gui, 0, 1, output_dir,
+    ))
+    all_annotations, rstats = result
+
+    _print(f"  Exported {rstats.get('frames_exported', 0)} frames")
+    _print(f"  GUI filtered: {rstats.get('frames_gui_filtered', 0)}")
+    _print(f"  No mask: {rstats.get('frames_no_mask', 0)}")
+    _print(f"  No image: {rstats.get('frames_no_image', 0)}")
+
+    # Step 3: Generate quality report
+    _print("[3/3] Generating quality report...")
+    if all_annotations:
+        report_path = generate_quality_report(
+            output_dir, all_annotations, max_per_cat=6)
+        _print(f"\n  Report saved: {report_path}")
+        _print(f"  Open this image to visually inspect bbox quality.")
+
+        # Bbox statistics
+        widths = [a["bbox"][2] for a in all_annotations]
+        heights = [a["bbox"][3] for a in all_annotations]
+        areas = [w * h for w, h in zip(widths, heights)]
+        _print(f"\n  Bbox stats:")
+        _print(f"    Width:  min={min(widths):.0f}  median={np.median(widths):.0f}  "
+               f"max={max(widths):.0f}")
+        _print(f"    Height: min={min(heights):.0f}  median={np.median(heights):.0f}  "
+               f"max={max(heights):.0f}")
+        _print(f"    Area:   min={min(areas):.0f}  median={np.median(areas):.0f}  "
+               f"max={max(areas):.0f}")
+
+        ann_by_cat = defaultdict(int)
+        for a in all_annotations:
+            ann_by_cat[a["category"]] += 1
+        _print(f"\n  Per-category breakdown:")
+        for cat, cnt in sorted(ann_by_cat.items(), key=lambda x: -x[1]):
+            _print(f"    {cat}: {cnt} annotations")
+    else:
+        _print("  WARNING: No annotations generated. Check parameters.")
+
+    # Cleanup preview checkpoint
+    cp = _checkpoint_path(output_dir, 0)
+    if os.path.exists(cp):
+        os.remove(cp)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build GroundingDINO fine-tuning dataset from MineStudio LMDBs"
@@ -1048,8 +1247,24 @@ def main():
                         help="Number of visualization samples (default: 0)")
     parser.add_argument("--workers", type=int, default=0,
                         help="Number of parallel workers (0=auto, 1=single-process)")
+    parser.add_argument("--preview", type=int, default=0, metavar="N",
+                        help="Preview mode: sample N events per category for "
+                             "quick quality evaluation (e.g. --preview 5)")
 
     args = parser.parse_args()
+
+    if args.preview > 0:
+        preview_dataset(
+            data_roots=args.data_root,
+            output_dir=args.output_dir,
+            n_events_per_cat=args.preview,
+            n_frames=args.n_frames,
+            skip_tail=args.skip_tail,
+            min_mask_area=args.min_mask_area,
+            max_mask_area_frac=args.max_mask_area,
+            filter_gui=not args.no_gui_filter,
+        )
+        return
 
     summary = build_dataset(
         data_roots=args.data_root,
