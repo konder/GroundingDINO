@@ -9,9 +9,9 @@ from datetime import datetime
 import torch
 
 from groundingdino.util.inference import load_model
-from eval.evaluator import run_evaluation
+from eval.evaluator import load_annotations, run_evaluation
 from eval.metrics import summarize_results
-from eval.visualize import generate_report
+from eval.visualize import generate_report, generate_visual_grid
 
 
 def get_best_device() -> str:
@@ -161,6 +161,12 @@ def main() -> None:
     if not args.no_viz:
         generate_report(summary_serializable, report_path)
         print(f"  Report image:     {report_path}")
+
+        grid_path = os.path.join(
+            args.output_dir, f"eval_{args.tag}_{timestamp}_grid.png")
+        annotations = load_annotations(args.annotations)
+        generate_visual_grid(results, annotations, args.image_dir, grid_path)
+        print(f"  Visual grid:      {grid_path}")
 
     print()
 

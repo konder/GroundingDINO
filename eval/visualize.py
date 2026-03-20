@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional, Sequence
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
+from PIL import Image
 
 
 def generate_report(summary: dict, output_path: str) -> str:
@@ -135,3 +136,89 @@ def _plot_summary_panel(ax, summary: dict) -> None:
                 fontweight="bold", color="#2c3e50")
         ax.text(0.95, y, val, fontsize=10, transform=ax.transAxes,
                 ha="right", color="#34495e")
+
+
+def _draw_box(ax, bbox_norm: Sequence[float], img_w: int, img_h: int,
+              color: str, label: str, linestyle: str = "-") -> None:
+    """Draw a normalized [x1,y1,x2,y2] bbox on an axes."""
+    x1, y1, x2, y2 = bbox_norm
+    px1, py1 = x1 * img_w, y1 * img_h
+    pw, ph = (x2 - x1) * img_w, (y2 - y1) * img_h
+    rect = mpatches.FancyBboxPatch(
+        (px1, py1), pw, ph,
+        linewidth=2, edgecolor=color, facecolor="none",
+        linestyle=linestyle,
+        boxstyle="square,pad=0",
+    )
+    ax.add_patch(rect)
+    ax.text(px1, py1 - 2, label, fontsize=6, color=color,
+            fontweight="bold", va="bottom",
+            bbox=dict(facecolor="black", alpha=0.5, pad=1, edgecolor="none"))
+
+
+def generate_visual_grid(
+    results: list,
+    annotations: list,
+    image_dir: str,
+    output_path: str,
+    cols: int = 4,
+) -> str:
+    """Generate a grid of test images with GT (green) and predicted (red) bboxes.
+
+    Args:
+        results: list of EvalResult from evaluator.
+        annotations: list of annotation dicts (with 'image', 'bbox', 'label', 'task').
+        image_dir: directory containing the test images.
+        output_path: where to save the grid image.
+        cols: number of columns in the grid.
+
+    Returns:
+        Path to the saved grid image.
+    """
+    n = len(results)
+    rows = (n + cols - 1) // cols
+
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 5, rows * 4))
+    if rows == 1:
+        axes = [axes] if cols == 1 else list(axes)
+    else:
+        axes = [ax for row in axes for ax in row]
+
+    for i, (res, ann) in enumerate(zip(results, annotations)):
+        ax = axes[i]
+        img_path = os.path.join(image_dir, ann["image"])
+        if os.path.exists(img_path):
+            img = Image.open(img_path).convert("RGB")
+            img_arr = np.array(img)
+            ax.imshow(img_arr)
+            img_w, img_h = img.size
+        else:
+            ax.text(0.5, 0.5, "IMAGE\nMISSING", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=14, color="red")
+            ax.set_facecolor("#1a1a1a")
+            img_w, img_h = 640, 360
+
+        _draw_box(ax, ann["bbox"], img_w, img_h,
+                  color="#00ff00", label=f"GT: {ann['label']}")
+
+        if res.pred_bbox is not None:
+            _draw_box(ax, res.pred_bbox, img_w, img_h,
+                      color="#ff3333", label=f"Pred ({res.pred_score:.2f})",
+                      linestyle="--")
+
+        iou_color = "#2ecc71" if res.iou >= 0.5 else "#e67e22" if res.iou >= 0.25 else "#e74c3c"
+        ax.set_title(f"{ann['task']}  |  IoU={res.iou:.3f}",
+                     fontsize=9, fontweight="bold", color=iou_color)
+        ax.axis("off")
+
+    for j in range(n, len(axes)):
+        axes[j].axis("off")
+
+    fig.suptitle("GroundingDINO Detection Results  (Green=GT, Red=Pred)",
+                 fontsize=14, fontweight="bold", y=1.0)
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return output_path

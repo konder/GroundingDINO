@@ -64,6 +64,16 @@ def build_caption_and_spans(
     return caption, id2span
 
 
+def build_dynamic_caption(
+    selected_cats: List[dict],
+) -> Tuple[str, Dict[int, List[List[int]]]]:
+    """Build a caption from a small subset of categories (for per-image use).
+
+    Same format as build_caption_and_spans but works with an arbitrary subset.
+    """
+    return build_caption_and_spans(selected_cats)
+
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -77,10 +87,25 @@ def _make_train_transform():
     ])
 
 
-class MinecraftCocoDataset(Dataset):
-    """COCO-format dataset for GroundingDINO fine-tuning."""
+import random as _random
 
-    def __init__(self, ann_path: str, img_dir: str, max_text_len: int = 256):
+
+class MinecraftCocoDataset(Dataset):
+    """COCO-format dataset for GroundingDINO fine-tuning.
+
+    Supports two caption modes:
+      - "global": one fixed caption with all categories (original behaviour)
+      - "dynamic": per-image caption with GT category + random negatives
+    """
+
+    def __init__(
+        self,
+        ann_path: str,
+        img_dir: str,
+        max_text_len: int = 256,
+        caption_mode: str = "dynamic",
+        n_neg_categories: int = 5,
+    ):
         from transformers import AutoTokenizer
 
         with open(ann_path) as f:
@@ -88,13 +113,22 @@ class MinecraftCocoDataset(Dataset):
 
         self.img_dir = img_dir
         self.max_text_len = max_text_len
+        self.caption_mode = caption_mode
+        self.n_neg_categories = n_neg_categories
         self.transform = _make_train_transform()
         self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
         self.images = {img["id"]: img for img in data["images"]}
         self.categories = data["categories"]
-        self.caption, self.id2span = build_caption_and_spans(self.categories)
-        self._tokenized = self.tokenizer(self.caption, return_tensors="pt")
+        self.cat_by_id = {cat["id"]: cat for cat in self.categories}
+
+        if caption_mode == "global":
+            self.caption, self.id2span = build_caption_and_spans(self.categories)
+            self._tokenized = self.tokenizer(self.caption, return_tensors="pt")
+        else:
+            self.caption = None
+            self.id2span = None
+            self._tokenized = None
 
         img2anns: Dict[int, list] = {}
         for ann in data["annotations"]:
@@ -117,12 +151,32 @@ class MinecraftCocoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _build_dynamic_caption(self, gt_cat_ids: List[int]):
+        """Build a short caption: GT categories + random negatives."""
+        gt_cats = []
+        gt_id_set = set(gt_cat_ids)
+        for cid in gt_cat_ids:
+            if cid in self.cat_by_id:
+                cat = self.cat_by_id[cid]
+                if cat not in gt_cats:
+                    gt_cats.append(cat)
+
+        neg_pool = [c for c in self.categories if c["id"] not in gt_id_set]
+        n_neg = min(self.n_neg_categories, len(neg_pool))
+        neg_cats = _random.sample(neg_pool, n_neg)
+
+        selected = list(gt_cats) + neg_cats
+        _random.shuffle(selected)
+
+        caption, id2span = build_dynamic_caption(selected)
+        tokenized = self.tokenizer(caption, return_tensors="pt")
+        return caption, id2span, tokenized
+
     def __getitem__(self, idx: int) -> dict:
         img_id, anns = self.samples[idx]
         img_info = self.images[img_id]
         img_path = os.path.join(self.img_dir, img_info["file_name"])
         image = Image.open(img_path).convert("RGB")
-        w, h = image.size
 
         boxes_xyxy = []
         cat_ids = []
@@ -135,13 +189,20 @@ class MinecraftCocoDataset(Dataset):
 
         target = {"boxes": boxes_xyxy}
         image, target = self.transform(image, target)
-        boxes_cxcywh = target["boxes"]  # cxcywh, normalized by Normalize transform
+        boxes_cxcywh = target["boxes"]
+
+        if self.caption_mode == "dynamic":
+            caption, id2span, tokenized = self._build_dynamic_caption(cat_ids)
+        else:
+            caption = self.caption
+            id2span = self.id2span
+            tokenized = self._tokenized
 
         spans_per_box = []
         for cid in cat_ids:
-            spans_per_box.append(self.id2span[cid])
+            spans_per_box.append(id2span[cid])
         positive_map = create_positive_map_from_span(
-            self._tokenized, spans_per_box, max_text_len=self.max_text_len
+            tokenized, spans_per_box, max_text_len=self.max_text_len
         )
 
         return {
@@ -149,7 +210,7 @@ class MinecraftCocoDataset(Dataset):
             "boxes": boxes_cxcywh,
             "labels": torch.tensor(cat_ids, dtype=torch.long),
             "positive_map": positive_map,
-            "caption": self.caption,
+            "caption": caption,
         }
 
 
@@ -510,6 +571,13 @@ def main():
                         help="Save checkpoint every N epochs")
     parser.add_argument("--val-split", type=float, default=0.1,
                         help="Fraction for validation split if --val-json not given")
+    parser.add_argument("--caption-mode", default="dynamic",
+                        choices=["global", "dynamic"],
+                        help="Caption strategy: global (all cats in one caption) "
+                             "or dynamic (per-image GT + random negatives)")
+    parser.add_argument("--n-neg-categories", type=int, default=5,
+                        help="Number of random negative categories per image "
+                             "(only for dynamic mode)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -537,9 +605,18 @@ def main():
     apply_freeze_strategy(model, args.freeze)
 
     # --- Dataset ---
-    full_dataset = MinecraftCocoDataset(args.train_json, args.train_images)
-    _print(f"[data] Loaded {len(full_dataset)} training samples, "
-           f"caption: \"{full_dataset.caption[:80]}...\"")
+    full_dataset = MinecraftCocoDataset(
+        args.train_json, args.train_images,
+        caption_mode=args.caption_mode,
+        n_neg_categories=args.n_neg_categories,
+    )
+    if args.caption_mode == "global":
+        _print(f"[data] Loaded {len(full_dataset)} samples, "
+               f"caption_mode=global, caption: \"{full_dataset.caption[:80]}...\"")
+    else:
+        _print(f"[data] Loaded {len(full_dataset)} samples, "
+               f"caption_mode=dynamic (1 GT + {args.n_neg_categories} neg per image), "
+               f"{len(full_dataset.categories)} total categories")
 
     if args.val_json and args.val_images:
         train_dataset = full_dataset
